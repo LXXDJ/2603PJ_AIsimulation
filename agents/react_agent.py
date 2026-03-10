@@ -45,6 +45,7 @@ Day 1: (행동)
 Day 2: (행동)
 ...
 Day {n}: (행동)
+Comment: (현재 상황에 대한 한국 직장인 스타일의 한줄 독백. 15~25자. 현실적이고 위트 있게, 블랙코미디 OK. 매번 다른 표현으로. 예: "퇴근은 내일의 나에게 맡긴다", "링크드인 프로필 사진을 바꿀 뻔했다", "만년 대리의 삶도 나름 편하다고 자기최면 중")
 
 가능한 행동 목록 (정확히 그대로 출력):
 {actions}
@@ -79,11 +80,19 @@ class ReActAgent(BaseAgent):
         system = self._batch_system_template.format(n=n, actions=self._actions_list())
         messages = [{"role": "user", "content": observation}]
         response = self.llm.call(system=system, messages=messages, max_tokens=64 * n)
-        return self._parse_batch(response, n)
+        actions, comment = self._parse_batch(response, n)
+        self._last_comment = comment
+        return actions
 
-    def _parse_batch(self, text: str, n: int) -> list[str]:
-        """Day 1: ... 형식에서 n개의 행동을 순서대로 추출한다."""
+    def _parse_batch(self, text: str, n: int) -> tuple[list[str], str]:
+        """Day 1: ... 형식에서 n개의 행동과 Comment를 추출한다."""
         actions = []
+        comment = ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Comment 파싱
+            if stripped.startswith("Comment:"):
+                comment = stripped[len("Comment:"):].strip()
         for i in range(1, n + 1):
             found = None
             for line in text.splitlines():
@@ -91,4 +100,4 @@ class ReActAgent(BaseAgent):
                     found = self._parse_action(line)
                     break
             actions.append(found or "프로젝트에 집중한다")
-        return actions
+        return actions, comment

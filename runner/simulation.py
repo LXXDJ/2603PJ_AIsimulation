@@ -28,6 +28,7 @@ def run_simulation(
     step_logs = []
     pending_actions: list[str] = []
     recent_events: list[tuple[int, str]] = []  # (day, 이벤트명) 누적
+    current_comment: str = ""  # LLM이 생성한 한줄 코멘트
 
     # 시뮬 시작 시 즉시 파일 생성 (중간에 중단해도 기록 보존)
     Path(log_dir).mkdir(exist_ok=True)
@@ -67,6 +68,7 @@ def run_simulation(
                 remaining = min(decision_interval, max_days - day + 1)
                 if decision_interval > 1:
                     pending_actions = agent.decide_batch(state, observation, remaining)
+                    current_comment = getattr(agent, '_last_comment', '') or ""
                 else:
                     pending_actions = [agent.decide(state, observation)]
 
@@ -93,6 +95,7 @@ def run_simulation(
             "energy": round(state.energy, 1),
             "events": state.events_today,
             "job_changes": state.job_changes,
+            "comment": current_comment,
         }
         step_logs.append(step)
         log_file.write(json.dumps(step, ensure_ascii=False) + "\n")

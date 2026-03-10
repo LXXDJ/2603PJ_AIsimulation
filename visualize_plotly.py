@@ -155,13 +155,14 @@ def _one_line_summary(s: dict) -> str:
     return "그럭저럭 버티는 중"
 
 
-def _hover_text(s: dict) -> str:
+def _hover_text(s: dict, personality: str = "") -> str:
     events_str = ", ".join(s.get("events", [])) or "없음"
-    summary = _one_line_summary(s)
+    summary = s.get("comment") or _one_line_summary(s)
     job_changes = s.get("job_changes", 0)
     job_str = f"  |  이직: {job_changes}회" if job_changes > 0 else ""
+    personality_str = f"  |  성향: {personality}" if personality else ""
     return (
-        f"<b>Day {s['day']}</b>  {s['position']}{job_str}<br>"
+        f"<b>Day {s['day']}</b>  {s['position']}{job_str}{personality_str}<br>"
         f"행동: {s['action']}<br>"
         f"─────────────────<br>"
         f"성과: {s.get('performance', 0):.0f}  |  "
@@ -422,7 +423,7 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
         days   = [s["day"] for s in steps]
         scores = [_composite_score(s) for s in steps]
         ma     = _moving_average(scores, window=30)
-        hovers = [_hover_text(s) for s in steps]
+        hovers = [_hover_text(s, personality=d["display"]) for s in steps]
         r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
         # 원시 점수 (흐릿)
@@ -449,50 +450,54 @@ def draw_comparison_html(log_paths: list, show: bool = False) -> Path:
             hovertemplate="%{hovertext}<extra></extra>",
         ), row=1, col=1)
 
-        # 승진 수직선
+        # 승진 마커 (그래프 위 ★ 점으로 표시, 호버로 상세 확인)
+        promo_days, promo_scores, promo_texts = [], [], []
         prev_pos = steps[0]["position"]
         for s in steps[1:]:
             if s["position"] != prev_pos:
-                fig.add_shape(
-                    type="line",
-                    xref="x", yref="paper",
-                    x0=s["day"], x1=s["day"],
-                    y0=0.58, y1=1.0,
-                    line=dict(color=color, width=1.2, dash="dash"),
-                    opacity=0.55,
-                )
-                fig.add_annotation(
-                    x=s["day"], y=0.97,
-                    xref="x", yref="paper",
-                    text=f"★ {d['display'][:2]} {s['position']}",
-                    showarrow=False,
-                    font=dict(size=9, color=color),
-                    yanchor="top",
+                promo_days.append(s["day"])
+                promo_scores.append(_composite_score(s))
+                promo_texts.append(
+                    f"<b>★ 승진!</b><br>{d['display']}: {prev_pos} → {s['position']}<br>"
+                    f"Day {s['day']} ({_day_to_label(s['day'])})<br>"
+                    f"연봉: {s['salary']:,}원"
                 )
                 prev_pos = s["position"]
+        if promo_days:
+            fig.add_trace(go.Scatter(
+                x=promo_days, y=promo_scores,
+                mode="markers",
+                marker=dict(color=color, size=12, symbol="star", line=dict(color="white", width=1)),
+                legendgroup=d["display"],
+                showlegend=False,
+                hovertemplate="%{text}<extra></extra>",
+                text=promo_texts,
+            ), row=1, col=1)
 
-        # 이직 마커 (job_changes 변화 감지)
+        # 이직 마커 (그래프 위 🔄 점으로 표시)
+        jc_days, jc_scores, jc_texts = [], [], []
         prev_jc = steps[0].get("job_changes", 0)
         for s in steps[1:]:
             cur_jc = s.get("job_changes", 0)
             if cur_jc > prev_jc:
-                fig.add_shape(
-                    type="line",
-                    xref="x", yref="paper",
-                    x0=s["day"], x1=s["day"],
-                    y0=0.58, y1=1.0,
-                    line=dict(color=color, width=1.5, dash="dot"),
-                    opacity=0.7,
-                )
-                fig.add_annotation(
-                    x=s["day"], y=0.92,
-                    xref="x", yref="paper",
-                    text=f"🔄 {d['display'][:2]} 이직{cur_jc}회",
-                    showarrow=False,
-                    font=dict(size=9, color=color),
-                    yanchor="top",
+                jc_days.append(s["day"])
+                jc_scores.append(_composite_score(s))
+                jc_texts.append(
+                    f"<b>🔄 이직 {cur_jc}회</b><br>{d['display']}<br>"
+                    f"Day {s['day']} ({_day_to_label(s['day'])})<br>"
+                    f"연봉: {s['salary']:,}원  |  {s['position']}"
                 )
                 prev_jc = cur_jc
+        if jc_days:
+            fig.add_trace(go.Scatter(
+                x=jc_days, y=jc_scores,
+                mode="markers",
+                marker=dict(color=color, size=10, symbol="diamond", line=dict(color="white", width=1)),
+                legendgroup=d["display"],
+                showlegend=False,
+                hovertemplate="%{text}<extra></extra>",
+                text=jc_texts,
+            ), row=1, col=1)
 
     fig.update_xaxes(tickvals=tickvals, ticktext=ticktext,
                      title_text="기간", row=1, col=1)

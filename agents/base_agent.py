@@ -14,6 +14,7 @@ class BaseAgent(ABC):
         self.personality = personality
         self.name = f"{self.base_name}_{personality.name}" if personality else self.base_name
         self.history: list[dict] = []   # {"day": int, "action": str, "observation": str}
+        self._last_comment: str = ""    # 배치 결정 시 LLM이 생성한 한줄 코멘트
 
     @abstractmethod
     def decide(self, state: GameState, observation: str) -> str:
