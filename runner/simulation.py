@@ -14,6 +14,7 @@ def run_simulation(
     max_days: int = 1095,
     log_interval: int = 30,
     decision_interval: int = 1,
+    reflection_interval: int = 90,
     log_dir: str = "logs",
     verbose: bool = True,
     tqdm_position: int = 0,
@@ -24,13 +25,12 @@ def run_simulation(
     상세 로그는 .txt 파일에 기록, 콘솔에는 진행률(%)만 출력한다.
     반환값: 최종 결과 딕셔너리
     """
-    state = env.reset()
-    agent.reset()
+    state = env.reset()                         # 환경 초기화
+    agent.reset()                               # 에이전트 초기화
     step_logs = []
-    pending_actions: list[str] = []
-    recent_events: list[tuple[int, str]] = []  # (day, 이벤트명) 누적
-    reflection_interval = 90  # 성찰 주기 (일) — 분기마다
-    last_reflection_day = 0   # 마지막 성찰 시점
+    pending_actions: list[str] = []             # LLM이 짜준 행동 계획 리스트
+    recent_events: list[tuple[int, str]] = []   # (day, 이벤트명) 누적
+    last_reflection_day = 0                     # 마지막 성찰 시점
 
     # 시뮬 시작 시 즉시 파일 생성 (중간에 중단해도 기록 보존)
     Path(log_dir).mkdir(exist_ok=True)
@@ -64,39 +64,38 @@ def run_simulation(
             # 주말: 성향별 가중치로 활동 선택
             state, full_observation, action = env.step_weekend()
         else:
-            # 배치 모드: 평일 계획이 소진되면 새로 요청
+            # 배치 모드: 30일 계획이 소진되면 새로 요청
             if not pending_actions:
                 # Reflection: 분기(90일)마다 자기성찰 (llm_reflect가 있을 때만)
                 if (hasattr(agent, 'reflect') and agent.llm_reflect
                         and day - last_reflection_day >= reflection_interval
                         and len(agent.history) >= reflection_interval):
-                    reflection_text = agent.reflect(
-                        state, window=reflection_interval,
-                        promotion_requirements=env.promotion_requirements,
+                    reflection_text = agent.reflect( # 최근 90일 행동 기록 + 현재 스탯 + 승진 요건을 보내서 전략 조언받기
+                        state, window=reflection_interval, promotion_requirements=env.promotion_requirements,
                     )
-                    last_reflection_day = day
-                    if reflection_text:
+                    last_reflection_day = day       # day 값으로 last_reflection_day 갱신
+                    if reflection_text:             # 텍스트 로그 파일에 성찰 내용 기록
                         txt_file.write(f"  [성찰] Day {day}\n")
                         for line in reflection_text.splitlines():
                             txt_file.write(f"    {line}\n")
                         txt_file.flush()
-                        log_file.write(json.dumps({
+                        log_file.write(json.dumps({ # JSONL 로그에도 동일하게 기록
                             "type": "reflection", "day": day,
                             "text": reflection_text,
                         }, ensure_ascii=False) + "\n")
-                        log_file.flush()
+                        log_file.flush()            # flush(): 버퍼에 안 남기고 즉시 파일에 쓰라는 뜻
 
-                observation = state.to_observation()
-                remaining = min(decision_interval, max_days - day + 1)
+                observation = state.to_observation()    # 현재 스탯 8종을 LLM이 읽을 수 있는 텍스트로 변환
+                remaining = min(decision_interval, max_days - day + 1)  # 배치 주기와 남은 일수 중 작은 값으로 요청
                 if decision_interval > 1:
-                    pending_actions = agent.decide_batch(state, observation, remaining)
+                    pending_actions = agent.decide_batch(state, observation, remaining) # LLM을 호출해서 30일치 행동 리스트 받아오기
                 else:
                     pending_actions = [agent.decide(state, observation)]
 
-            action = pending_actions.pop(0)
+            action = pending_actions.pop(0)         # 리스트 맨 앞에서 하나를 꺼냄 (매일 하나씩 꺼내서 실행)
 
             # 환경 1일 전진
-            state, full_observation = env.step(action)
+            state, full_observation = env.step(action)  # full_observation: 오늘 일어난 일의 텍스트 설명
 
         # 기록
         agent.record(day, action, full_observation)

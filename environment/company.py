@@ -244,15 +244,15 @@ class CompanyEnvironment:
             self._job_change_counter = max(0, self._job_change_counter - 1)
 
         effects = ACTION_EFFECTS[action]
-        self._apply_effects(effects, action)
+        self._apply_effects(effects, action)    # 성향 배율 곱셈
 
-        # 2. 자연 회복 / 자연 저하 (매일 소폭 변화)
+        # 2. 자연 회복 / 저하 (매일 소폭 변화)
         self._apply_daily_drift()
 
         # 3. 랜덤 이벤트 발생
         events = self._filter_events(roll_events(self.rng, self.personality, self.state))
         for event in events:
-            self._apply_effects(event.effects)
+            self._apply_effects(event.effects)  # 이벤트 효과 적용
             for key, value in event.resets.items():
                 if hasattr(self.state, key):
                     setattr(self.state, key, float(value))
@@ -261,7 +261,7 @@ class CompanyEnvironment:
             self.state.events_today.append(event.name)
             log_lines.append(f"이벤트: {event.description}")
 
-        # 4. 수치 범위 클램프
+        # 4. 수치 범위 클램프 (모든 스탯 0~100 범위 제한)
         self.state.clamp_all()
 
         # 5. 번아웃 / 만성스트레스 / 희망퇴직 판정 (해고보다 먼저)

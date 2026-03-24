@@ -20,8 +20,8 @@ class BaseAgent(ABC):
         self._reflection: str = ""      # 최근 자기성찰 결과
         self.memory = EpisodicMemory(capacity=50)  # 중요 사건 기억 저장소
 
-    @abstractmethod
-    def decide(self, state: GameState, observation: str) -> str:
+    @abstractmethod # "상속받는 클래스가 반드시 구현해야 한다"는 강제 규칙
+    def decide(self, state: GameState, observation: str) -> str:    # "나중에 에이전트 타입을 추가할 수 있다"는 확장 가능성을 위한 설계이고, 지금 당장은 없어도 되는 코드
         """현재 상태를 받아 행동 하나를 반환한다."""
 
     def decide_batch(self, state: GameState, observation: str, n: int) -> list[str]:
@@ -40,7 +40,7 @@ class BaseAgent(ABC):
     # 공통 유틸
     # ------------------------------------------------------------------
 
-    @staticmethod
+    @staticmethod   # self(자기 자신의 데이터에 접근)를 안 쓰는 함수
     def _parse_action(text: str) -> str:
         """LLM 응답 텍스트에서 유효한 행동 하나를 추출한다."""
         for action in ACTIONS:
@@ -49,6 +49,6 @@ class BaseAgent(ABC):
         # 파싱 실패 시 기본 행동
         return "프로젝트에 집중한다"
 
-    @staticmethod
+    @staticmethod   # 기능상 차이보다는 "이 함수는 객체 상태와 무관하다"는 가독성 표시
     def _actions_list() -> str:
         return "\n".join(f"- {a}" for a in ACTIONS)

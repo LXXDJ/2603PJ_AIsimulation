@@ -22,7 +22,8 @@ LOG_INTERVAL       = 30     # 콘솔 출력 주기 (일) — 분기마다
 DECISION_INTERVAL  = 30     # 배치 결정 주기 (일) — 한달치 한 번에 결정
 
 # ── Reflection 설정 ────────────────────────────────────
-USE_REFLECTION     = False               # 자기성찰 기능 on/off
+USE_REFLECTION     = False              # 자기성찰 기능 on/off
+REFLECTION_INTERVAL = 90                # 성찰 주기 (일) — 분기마다
 MODEL_DECISION     = "gpt-4.1-mini"     # 배치 결정 + 히스토리 압축용 (저렴/빠름)
 MODEL_REFLECTION   = "gpt-4.1"          # Reflection 전용 (고품질)
 
@@ -52,7 +53,8 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
     return run_simulation(
         agent=agent, env=env,
         max_days=MAX_DAYS, log_interval=LOG_INTERVAL,
-        decision_interval=DECISION_INTERVAL, verbose=True,
+        decision_interval=DECISION_INTERVAL,
+        reflection_interval=REFLECTION_INTERVAL, verbose=True,
         tqdm_position=tqdm_position,
     )
 
@@ -83,16 +85,12 @@ def main():
 
     # 병렬 실행
     results_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor: # 스레드 5개 준비
-        # with 블록을 빠져나오는 순간 shutdown(wait=True)가 자동 호출
-        # 1. 아직 실행 중인 스레드가 있으면 전부 끝날 때까지 대기
-        # 2. 스레드 풀 자원 해제
-        # with를 안 쓰고 executor.shutdown()을 직접 안 불러주면, 스레드가 프로그램 종료 후에도 남아서 좀비처럼 돌 수 있습니다.
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
         future_to_key = {}
         for i, job in enumerate(jobs):
-            future = executor.submit(_run_one, *job["args"], tqdm_position=i, **job["kwargs"])   # submit()으로 작업 5개 제출 → 5개 동시 실행 시작
+            future = executor.submit(_run_one, *job["args"], tqdm_position=i, **job["kwargs"])
             future_to_key[future] = job["key"]
-        for future in as_completed(future_to_key):  # as_completed()로 끝나는 순서대로 결과 수거
+        for future in as_completed(future_to_key):
             key = future_to_key[future]
             try:
                 results_map[key] = future.result()
