@@ -1,5 +1,10 @@
 # 개인 프로젝트 : AI Simulation (회사원) - 코드 리뷰
 
+### 참고사이트
+- https://docs.oasis.camel-ai.org/introduction
+- https://github.com/camel-ai/oasis
+- https://mirofish-demo.pages.dev/console
+
 ## 목차
 
 **[1. 프로젝트 소개 + 아키텍처](#1-프로젝트-소개--아키텍처)**
