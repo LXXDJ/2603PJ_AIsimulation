@@ -99,6 +99,14 @@ REFLECTION_PROMPT = """
 - (행동명) Y일 (이유)
 - (행동명) Z일 (이유)
 합계 30일. 반드시 부족한 스탯을 올리는 행동을 최우선으로 배분하세요.
+
+[!] 마지막에 반드시 아래 JSON 블록을 출력하세요. 이 JSON이 코드에서 직접 파싱되어 행동 계획을 강제 보정합니다.
+행동명은 반드시 가능한 행동 목록에 있는 이름을 정확히 사용하세요.
+값은 30일 기준 최소 일수입니다. 합계가 정확히 30이어야 합니다.
+
+```json
+{{"야근한다": 0, "상사와 점심을 먹는다": 0, "동료를 도와준다": 0, "정치적으로 행동한다": 0, "이직 준비를 한다": 0, "휴가를 쓴다": 0, "자기계발을 한다": 0, "프로젝트에 집중한다": 0}}
+```
 """.strip()
 
 
@@ -171,6 +179,94 @@ def _parse_batch(text: str, n: int) -> list[str]:
                 break
         actions.append(found or "프로젝트에 집중한다")
     return actions
+
+
+import re as _re
+
+
+def _parse_quota(reflection_text: str) -> dict[str, int] | None:
+    """Reflection 응답에서 JSON 처방 블록을 파싱하여 {행동명: 최소일수} dict로 반환.
+    파싱 실패 시 None을 반환하여 기존 텍스트 방식으로 폴백."""
+    # ```json ... ``` 블록 추출
+    m = _re.search(r"```json\s*(\{.*?\})\s*```", reflection_text, _re.DOTALL)
+    if not m:
+        # 코드블록 없이 bare JSON인 경우도 시도
+        m = _re.search(r'(\{[^{}]*"[^{}]*\})', reflection_text, _re.DOTALL)
+    if not m:
+        return None
+    try:
+        quota = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    # 유효성 검증: 모든 키가 ACTIONS에 있는지, 값이 정수인지
+    valid = {}
+    for action in ACTIONS:
+        val = quota.get(action, 0)
+        valid[action] = max(0, int(val))
+    # 합계가 30이 아니면 비례 보정
+    total = sum(valid.values())
+    if total == 0:
+        return None
+    if total != 30:
+        factor = 30 / total
+        adjusted = {k: max(0, round(v * factor)) for k, v in valid.items()}
+        # 반올림 오차 보정 — 가장 큰 항목에서 조정
+        diff = 30 - sum(adjusted.values())
+        if diff != 0:
+            max_key = max(adjusted, key=adjusted.get)
+            adjusted[max_key] += diff
+        valid = adjusted
+    return valid
+
+
+def _enforce_quota(actions: list[str], quota: dict[str, int]) -> list[str]:
+    """LLM이 생성한 행동 계획(actions)을 quota 기준으로 강제 보정.
+    quota에 명시된 최소 일수를 반드시 충족시킨다."""
+    from collections import Counter
+    n = len(actions)
+    current = Counter(actions)
+
+    # 부족한 행동 파악
+    deficits: dict[str, int] = {}
+    for action_name, min_days in quota.items():
+        shortage = min_days - current.get(action_name, 0)
+        if shortage > 0:
+            deficits[action_name] = shortage
+
+    if not deficits:
+        return actions  # 이미 충족
+
+    # 초과 배정된 행동 파악 (교체 후보)
+    # quota보다 많이 배정된 행동에서 빼온다 (단, 휴가는 보호)
+    excess_indices: list[int] = []
+    excess_count: dict[str, int] = {}
+    for action_name in ACTIONS:
+        if action_name == "휴가를 쓴다":
+            continue  # 휴가는 LLM이 더 넣은 걸 허용 (생존 보호)
+        surplus = current.get(action_name, 0) - quota.get(action_name, 0)
+        if surplus > 0:
+            excess_count[action_name] = surplus
+
+    # 초과분이 큰 행동부터 교체 후보 인덱스 수집 (뒤에서부터)
+    for idx in reversed(range(n)):
+        act = actions[idx]
+        if act == "휴가를 쓴다":
+            continue  # 휴가 슬롯은 교체 대상에서 제외
+        if excess_count.get(act, 0) > 0:
+            excess_indices.append(idx)
+            excess_count[act] -= 1
+
+    # 부족한 행동을 교체
+    result = list(actions)
+    replace_idx = 0
+    for action_name, shortage in sorted(deficits.items(), key=lambda x: -x[1]):
+        for _ in range(shortage):
+            if replace_idx < len(excess_indices):
+                result[excess_indices[replace_idx]] = action_name
+                replace_idx += 1
+            # 교체 후보가 부족하면 그대로 둠 (최선의 보정)
+
+    return result
 
 
 def _build_promotion_gap(state, requirements: dict | None) -> str:
@@ -312,6 +408,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
     recent_events: list[tuple[int, str]] = []
     last_reflection_day = 0
     reflection_text = ""
+    action_quota: dict[str, int] | None = None  # Reflection이 처방한 행동 배분 (구조적 강제)
 
     # LLM 압축용 클라이언트 (기존 모듈 재사용)
     from llm.client import LLMClient
@@ -383,12 +480,20 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                     last_reflection_day = day
 
                     if reflection_text:
+                        # JSON 처방 파싱 (구조적 강제)
+                        action_quota = _parse_quota(reflection_text)
+
                         txt_file.write(f"  [성찰] Day {day}\n")
                         for line in reflection_text.splitlines():
                             txt_file.write(f"    {line}\n")
+                        if action_quota:
+                            txt_file.write(f"  [처방 quota] {action_quota}\n")
+                        else:
+                            txt_file.write(f"  [처방 quota] 파싱 실패 — 텍스트 방식 폴백\n")
                         txt_file.flush()
                         log_file.write(json.dumps({
                             "type": "reflection", "day": day, "text": reflection_text,
+                            "quota": action_quota,
                         }, ensure_ascii=False) + "\n")
                         log_file.flush()
 
@@ -409,6 +514,11 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                 )
                 response_text = _extract_text(batch_result["messages"][-1])
                 pending_actions = _parse_batch(response_text, remaining)
+
+                # 구조적 강제 보정: quota가 있으면 LLM 계획을 강제 수정
+                # 단, 위험 상태(스트레스 70+/체력 30 이하)에서는 스킵 — 생존 우선
+                if action_quota and state.stress < 70 and state.energy > 30:
+                    pending_actions = _enforce_quota(pending_actions, action_quota)
 
             action = pending_actions.pop(0)
             state, full_observation = env.step(action)
