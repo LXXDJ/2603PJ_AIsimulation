@@ -23,6 +23,8 @@ from environment.state import ACTIONS
 from evaluation.metrics import compare_agents
 from memory.episodic import Episode, EpisodicMemory
 
+from confluence_mcp import confluence_custom
+
 
 # ── 실험 설정 ──────────────────────────────────────────
 EXPERIMENT_SEED    = 42     # 모든 에이전트가 동일한 이벤트 시퀀스를 경험 (랜덤 이벤트 순서를 고정하는 값) : 값 자체는 아무 숫자나 상관없고, 바꾸면 이벤트 순서가 달라짐
@@ -42,6 +44,12 @@ ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워
 
 # ── Reflection on/off 비교 실험 설정 ────────────────────
 AB_COMPARE = ["정치형"]
+
+# ── Confluence 연동 (직접 만든 MCP 서버 사용) ──────────
+# code-driven: Reflection 직전/직후에 코드가 도구 호출. LLM은 Confluence를 모름.
+# 서버(confluence_mcp_server/)가 도메인 도구 2개를 노출하고, 클라이언트(confluence_mcp/)가 호출.
+USE_CONFLUENCE     = True
+PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Reflection 최대 개수
 
 
 # ── Reflection 프롬프트 (기존과 동일) ──────────────────
@@ -89,7 +97,7 @@ REFLECTION_PROMPT = """
 
 [ 에피소딕 메모리 (주요 과거 경험) ]
 {memory_text}
-
+{past_reflections_section}
 다음 형식으로 정확히 응답하세요:
 
 평가: (지난 기간 행동 비율과 스탯 변화를 수치로 평가. 어떤 행동을 너무 많이/적게 했는지 지적)
@@ -459,6 +467,18 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                     memory_text_for_reflect = memory.to_text(n=5)
                     personality_section_reflect = f"에이전트 성향: {personality.name}\n{personality.description}"
 
+                    # Confluence(직접 만든 MCP 서버)에서 과거 Reflection 조회
+                    past_reflections_section = ""
+                    if USE_CONFLUENCE:
+                        past_text = confluence_custom.fetch_past_reflections_text(
+                            agent_name, limit=PAST_REFLECT_LIMIT,
+                        )
+                        if past_text:
+                            past_reflections_section = (
+                                f"\n[ 과거 Reflection 기록 (Confluence) ]\n"
+                                f"{past_text}\n"
+                            )
+
                     reflect_prompt = REFLECTION_PROMPT.format(
                         window=REFLECTION_INTERVAL,
                         personality_section=personality_section_reflect,
@@ -466,6 +486,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                         current_state=state.to_observation(),
                         memory_text=memory_text_for_reflect,
                         promotion_gap=promotion_gap,
+                        past_reflections_section=past_reflections_section,
                     )
 
                     # Deep Agent invoke로 Reflection 실행
@@ -496,6 +517,18 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                             "quota": action_quota,
                         }, ensure_ascii=False) + "\n")
                         log_file.flush()
+
+                        # 직접 만든 MCP 서버로 Reflection 저장 (실패해도 시뮬레이션 계속)
+                        if USE_CONFLUENCE:
+                            saved = confluence_custom.save_reflection(
+                                agent_name=agent_name,
+                                day=day,
+                                text=reflection_text,
+                                quota=action_quota,
+                                run_id=timestamp,
+                            )
+                            txt_file.write(f"  [Confluence 저장] {'성공' if saved else '실패'}\n")
+                            txt_file.flush()
 
                 # 배치 결정 (30일치)
                 observation = state.to_observation()
