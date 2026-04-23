@@ -23,7 +23,7 @@ from environment.state import ACTIONS
 from evaluation.metrics import compare_agents
 from memory.episodic import Episode, EpisodicMemory
 
-import confluence_official
+from confluence_mcp import confluence_official
 
 
 # ── 실험 설정 ──────────────────────────────────────────
@@ -38,11 +38,18 @@ REFLECTION_INTERVAL = 90                # 성찰 주기 (일) — 분기마다
 MODEL_DECISION     = "gpt-4.1-mini"     # 배치 결정 + 히스토리 압축용 (저렴/빠름)
 MODEL_REFLECTION   = "gpt-4.1"          # Reflection 전용 (고품질)
 
-# ── Confluence 연동 (옵션 B / code-driven) ──────────────
-# True면 매 Reflection을 mcp-atlassian으로 Confluence에 저장하고, 다음 Reflection 직전에 과거 기록을 조회해 주입.
+# ── Confluence 연동 ────────────────────────────────────
 # .env에 CONFLUENCE_URL/USERNAME/API_TOKEN이 설정되어 있어야 함.
+#
+# code-driven (옵션 B): 코드가 호출 시점/내용을 결정. LLM은 Confluence를 모름.
+# - Reflection 직전: 과거 기록 fetch → 프롬프트 주입
+# - Reflection 직후: 결과를 Confluence 페이지로 저장
 USE_CONFLUENCE     = True
 PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Reflection 최대 개수
+#
+# LLM-driven (옵션 A): LLM이 도구 자율 호출. 시뮬레이션 시작 시 성향별 프로필 1회.
+# - 코드는 도구 셋(create_page만)·부모/제목 prefix만 강제, 본문은 LLM이 자유 작성
+USE_LLM_PROFILE    = True
 
 # ── 비교할 성향 목록 ────────────────────────────────────
 # 사용 가능한 성향: "균형형", "성과형", "사교형", "정치형", "워라밸형"
@@ -435,6 +442,22 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
     log_file.flush()
     txt_file.write(f"{'='*60}\n에이전트: {agent_name}  (시작: {datetime.now().isoformat()})\n{'='*60}\n")
     txt_file.flush()
+
+    # LLM-driven 데모: 시뮬레이션 시작 시점에 성향별 프로필 페이지를 LLM이 자율 작성
+    if USE_LLM_PROFILE:
+        from confluence_mcp.llm_personality import create_personality_profile
+        profile_ok = create_personality_profile(
+            personality=personality,
+            agent_name=agent_name,
+            run_id=timestamp,
+            model=MODEL_REFLECTION,
+        )
+        txt_file.write(f"  [성향 프로필 LLM 등록] {'성공' if profile_ok else '실패'}\n")
+        txt_file.flush()
+        log_file.write(json.dumps({
+            "type": "llm_profile", "agent": agent_name, "ok": profile_ok,
+        }, ensure_ascii=False) + "\n")
+        log_file.flush()
 
     pbar = tqdm(
         total=MAX_DAYS, desc=f"{agent_name}", position=tqdm_position,

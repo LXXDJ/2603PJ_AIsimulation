@@ -1,901 +1,346 @@
-# 개인 프로젝트 : AI Simulation (회사원) - 코드 리뷰
+# Confluence 연동 (공식/커뮤니티 MCP 사용)
 
-### 참고사이트
-- https://docs.oasis.camel-ai.org/introduction
-- https://github.com/camel-ai/oasis
-- https://mirofish-demo.pages.dev/console
+이 브랜치(`feature/mcp-confluence-official`)는 **시뮬레이션 본체에 손을 대지 않고 Confluence를 붙이는** 작업의 결과물이다.
+시뮬레이션이 매 분기 만들어내는 Reflection(자기성찰 결과)을 Confluence 페이지로 영구 저장하고, 다음 회차의 프롬프트에 다시 주입한다.
+
+핵심 의도는 **"이미 있는 MCP 서버를 그대로 끼워 쓰는 경로"의 비용·구조를 코드로 박제해 두는 것**이다. 다른 브랜치(`feature/mcp-confluence-custom`)에서 직접 만든 MCP 서버와 줄나란히 놓고 비교하기 위함.
+
+---
 
 ## 목차
 
-**[1. 프로젝트 소개 + 아키텍처](#1-프로젝트-소개--아키텍처)**
-
-- 주제: 회사에서 살아남기
-- 목적: 딥 에이전트 기능 심화 학습
-
-**[2. 시뮬레이션 결과](#2-시뮬레이션-결과)**
-
-- 5가지 성향 비교 HTML → 누가 승진하고, 누가 해고되는지
-- 정치형 Reflection A/B 비교 HTML → 성찰 유무에 따른 차이
-
-**[3. 전체 코드 흐름 + Reflection 심화](#3-전체-코드-흐름--reflection-심화)**
-
-- Reflection 기본 구조: 90일마다 gpt-4.1이 자기평가 → 다음 30일 계획에 반영
-- 구현 과정에서 겪은 문제들:
-    - 1단계: 기본 구조 구현 → 성찰 내용이 추상적, Reflect가 오히려 역효과
-    - 2단계: 수치 제공 + 주기 90일 + 처방 형식 → 구체성은 살렸지만 mini 모델이 무시
-    - 3단계: 프롬프트 3곳 강화 (`[!][!][!]`, 강제 원칙) → 야근 남발 → 번아웃 악순환
-    - 4단계: 체력/스트레스 관리 원칙 + 희망퇴직 경고 → **최종 성공 (17년 부장 vs 5년 사원)**
-- 메모리: 커스텀 3계층 메모리 — Deep Agents 내장 메모리를 사용하지 않은 이유
-- 핵심 교훈: **LLM에게 "하라고 텍스트로 말하는 것"과 "구조적으로 하게 만드는 것"은 다르다.**
-
-**[4. MCP 연동 — 공식 vs 직접 구현 비교](#4-mcp-연동--공식-vs-직접-구현-비교)** *(이 브랜치 작업)*
-
-- 두 가지 구현을 별도 브랜치에서 진행하고 비교 코드리뷰
-  - `feature/mcp-confluence-official` — 공식/커뮤니티 MCP 서버 사용
-  - `feature/mcp-confluence-custom` — MCP 서버 직접 구현
-- 핵심 통찰: **MCP 서버 쪽에 결정적 로직을 더 많이 둘수록 시스템이 안정·저렴해진다.**
-
-**5. Q&A**
+1. [사전 준비](#1-사전-준비)
+2. [전체 구조](#2-전체-구조)
+3. [지금 코드가 실제로 하는 일](#3-지금-코드가-실제로-하는-일)
+4. [mcp-atlassian이 노출하는 도구 전수](#4-mcp-atlassian이-노출하는-도구-전수)
+5. [사용 예시 (코드 스니펫)](#5-사용-예시-코드-스니펫)
+6. [통합 패턴 두 가지: code-driven vs LLM-driven](#6-통합-패턴-두-가지-code-driven-vs-llm-driven)
+7. [검증 스크립트 (4개)](#7-검증-스크립트-4개)
+8. [현 구조의 한계 (다른 브랜치와의 비교 포인트)](#8-현-구조의-한계-다른-브랜치와의-비교-포인트)
 
 ---
 
-# 1. **프로젝트 소개 + 아키텍처**
+## 1. 사전 준비
 
-## **소개**
+### 1-1. 의존성
 
-- 주제 : 회사에서 살아남기
-- 목적 : 딥 에이전트 기능 심화 학습 (Reflection)
-  - LLM이 직접 **의사결정 주체**가 되어 자율적으로 행동하고, 그 결과를 관찰하는 구조
-
-> **핵심 질문: 어떤 성향이 회사에서 가장 오래, 가장 높이 올라갈까?**
-
-| 성향 | 전략 |
-|------|------|
-| 균형형 | 모든 스탯을 고르게 올림 |
-| 성과형 | 업무 능력과 성과에 올인 |
-| 사교형 | 동료 관계와 평판에 집중 |
-| 정치형 | 상사 라인을 타고 정치력으로 승부 |
-| 워라밸형 | 스트레스 관리와 체력 유지에 집중 |
-
-- **Reflection(자기성찰) on/off 비교**
-  - 일정 기간마다 자기 상태를 돌아보고 전략을 수정하는 기능
-  - 효과가 있는지, 오히려 방해가 되는지 같은 성향끼리 비교 실험
-
-## **아키텍처**
-
-> 핵심 흐름: 매일 루프 → 30일마다 행동 계획(LLM) → 90일마다 자기성찰(LLM) → 환경 처리 → 종료 판정
-
-![서비스 흐름](architecture.png)
-
-1. 초기화 단계에서 에이전트 5개를 병렬 생성
-2. 매일 반복 루프에 들어감
-3. 하루의 흐름
-    1. 주말인지 평일인지 구분
-        1. 주말인 경우, LLM 호출 없이 성향별 가중치로 활동을 자동 선택
-        2. 평일인 경우, 30일치 행동 계획이 남았는지 확인
-            - 계획이 남아있으면 → 하나 꺼내서 실행
-            - 소진됐으면 → 여기서 두 가지 LLM 호출
-                - 90일이 경과했으면 **Reflection LLM** (gpt-4.1) : 자기성찰. 승진 요건 대비 현재 스탯 갭 분석, 문제점 진단
-                - 그 다음 **배치 결정 LLM** (gpt-4.1-mini) **:** 다음 30일치 행동 계획 생성
-                  - 미리 정의된 행동 중에서 LLM이 현재 스탯 + 성향 + 메모리를 보고 스스로 판단해서 선택
-                  - 확률 테이블이 아니라 LLM의 자체 판단이지만, 성향 설명이 프롬프트에 들어가 있어서 성향별 편향이 자연스럽게 발생
-    2. 행동 실행
-    3. 환경 처리에서 스탯 변동
-    4. 랜덤 이벤트 발생
-    5. 중요한 사건은 메모리에 저장
-    6. 종료 판정 여부 확인
-        1. 다양한 이유로 탈락할 수 있고, 20년을 버티면 정년퇴직 (번아웃, 만성 스트레스, 권고사직, 해고)
-
----
-
-# 2. 시뮬레이션 결과
-
-## 5가지 성향 비교 결과
-
-| 순위 | 성향 | 최종 직급 | 연봉 | 생존 기간 | 결말 |
-|:---:|------|:---:|---:|:---:|:---:|
-| 1위 | **성과형** | 임원 | 3억 | 20년 | 현직유지 |
-| 2위 | **사교형** | 임원 | 2.8억 | 20년 | 현직유지 |
-| 3위 | **균형형** | 이사 | 1.8억 | 20년 | 정년퇴직 |
-| 4위 | 워라밸형 | 과장 | 8,500만 | 15년 | 권고사직 |
-| 5위 | 정치형 | 사원 | 4,100만 | 5년 | 권고사직 |
-
-### 왜 이런 결과가 나왔나
-
-- **성과형** — 업무 능력과 성과에 올인 → 승진 요건을 가장 빠르게 충족
-- **사교형** — 평판으로 승진 요건 안정적 충족 + 동료 관계가 이벤트에서도 유리
-- **균형형** — 어디서도 밀리지 않지만, 돌출 스탯이 없어서 임원까지는 못 감
-- **워라밸형** — 스탯은 전부 충족했지만 승진 확률 판정에서 3번 탈락 → 권고사직
-- **정치형** — 상사신뢰↑ 정치력↑ but 평판 0.2 → 대리 승진에 필요한 평판 12를 못 채움
-
-### 스탯 그래프 특징
-
-| 성향 | 높은 스탯 | 낮은 스탯 |
-|------|----------|----------|
-| 성과형 | 업무능력, 성과 (빠르게 상승) | - |
-| 사교형 | 동료관계, 평판 (꾸준히 높음) | - |
-| 워라밸형 | 체력↑ 스트레스↓ | 나머지 스탯 상승 느림 |
-| 정치형 | 상사신뢰 | 평판 (바닥) |
-
-## Reflection(자기성찰) on/off 비교 결과
-
-> 가장 빨리 해고되는 **정치형**에 대해서 자기성찰을 할 경우 얼마나 변화가 있을지 실험
-
-| | Reflection ON | Reflection OFF |
-|---|---|---|
-| 최종 직급 | **부장** | 사원 |
-| 연봉 | 1.3억 | 4,100만 |
-| 생존 기간 | 17년 | 5년 |
-| 결말 | 희망퇴직 (자발적) | 권고사직 (평판 바닥) |
-
-### 핵심
-
-| | Reflection ON | Reflection OFF |
-|---|---|---|
-| 90일마다 | gpt-4.1이 스탯 갭 분석 + 처방 | (없음) |
-| 행동 패턴 | 처방에 따라 평판 보완 행동 추가 | 정치 행동만 반복 |
-| 평판 변화 | 0.2 → 12 돌파 (대리 승진 가능) | 0.2 고정 (승진 불가) |
-| 결과 | 17년 부장, 희망퇴직 | 5년 사원, 권고사직 |
-
-### 요약
-
-> Reflection은 에이전트가 자기 약점을 인식하고 행동을 수정할 수 있게 해주는 기능
-
-특히 성향에 의한 편향이 강한 에이전트(정치형처럼)에게 효과가 큼
-
-다만, 구현 과정이 핵심에서 설명처럼 단순하지 않음 (구현 과정에서 겪은 문제들은 코드 리뷰에서 자세히 다룸)
-
----
-
-# 3. **전체 코드 흐름** + Reflection 심화
-
-## **전체 코드 흐름**
-
-```
-main.py 설정 → ThreadPoolExecutor 병렬 실행
-  → _run_one(): create_deep_agent() × 2 + CompanyEnvironment 생성
-    → 매일 루프 (Day 1~7300)
-      → 주말: env.step_weekend() (LLM 호출 없음)
-      → 평일: decision_agent.invoke() → 30일 계획 생성
-        → env.step(): 행동 효과 → 자연 변화 → 랜덤 이벤트 → 생존 판정
-        → _store_episode_if_important(): 중요 사건만 메모리 저장
+```bash
+pip install langchain-mcp-adapters mcp-atlassian python-dotenv
 ```
 
----
+- `mcp-atlassian` — Python으로 작성된 커뮤니티 MCP 서버 (Atlassian 공식 제공이 아님). API Token 인증.
+- `langchain-mcp-adapters` — MCP 도구를 LangChain `BaseTool`로 어댑팅하는 브릿지.
 
-### **시작점: main.py — 설정**
+### 1-2. 환경변수 (`.env`)
 
-> 🟢 **`main.py`** → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+```dotenv
+CONFLUENCE_URL=https://atdev-ai.atlassian.net/wiki
+CONFLUENCE_USERNAME=<Atlassian 로그인 이메일>
+CONFLUENCE_API_TOKEN=<https://id.atlassian.com/manage-profile/security/api-tokens 에서 발급>
+```
 
-상단에서 기본적인 설정 가능
+> Atlassian의 **공식 Remote MCP**(OAuth 2.1+PKCE)는 Python에서 LangChain 어댑터가 OAuth 2.1을 아직 지원하지 않아 직접 못 붙는다 (관련 이슈 close됨, "not planned"). 그래서 이 브랜치에서는 커뮤니티 서버 `mcp-atlassian`(API Token)을 사용한다. 이것 자체가 "공식 vs 커뮤니티"의 한 차이점이며, README 8장의 한계 항목에 이어진다.
+
+### 1-3. 저장 대상 페이지
+
+`confluence_official.py` 상단의 두 상수가 저장 위치를 정한다.
 
 ```python
-EXPERIMENT_SEED    = 42          # 랜덤 시드 — 모든 에이전트가 동일한 이벤트를 경험
-MAX_DAYS           = 7300        # 20년
-DECISION_INTERVAL  = 30          # 30일치 행동을 한 번에 결정
-REFLECTION_INTERVAL = 90         # 성찰 주기 — 분기마다
-
-MODEL_DECISION     = "gpt-4.1-mini"    # 배치 결정용 (저렴/빠름)
-MODEL_REFLECTION   = "gpt-4.1"         # Reflection용 (고품질)
-
-ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워라밸형"]
-AB_COMPARE = ["정치형"]   # 정치형 Reflection on/off 나란히 비교
+PARENT_PAGE_ID = "120520708"  # 이 페이지의 자식으로 모든 Reflection을 매단다
+SPACE_KEY = "mcptest"
 ```
+
+테스트용 스페이스/페이지를 미리 만들어 두고 ID만 바꾸면 어디든 붙일 수 있다.
 
 ---
 
-### **main.py — 병렬 실행**
+## 2. 전체 구조
 
-> `main.py` → 🟢 **`ThreadPoolExecutor`** → `_run_one()` → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
+### 2-1. 파일 구성
 
-5개 성향을 스레드 풀로 동시 실행. `as_completed()`로 먼저 끝나는 순서대로 결과를 수거.
-
-```python
-with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-    future_to_key = {}
-    for i, job in enumerate(jobs):
-        future = executor.submit(_run_one, *job["args"],
-                                 tqdm_position=i, **job["kwargs"])
-        future_to_key[future] = job["key"]
-    for future in as_completed(future_to_key):
-        key = future_to_key[future]
-        results_map[key] = future.result()
-```
-
-- `with` 블록을 빠져나오면 `shutdown(wait=True)`가 자동 호출 → 전부 끝날 때까지 대기 후 스레드 풀 해제
-- `with`를 안 쓰면 스레드가 프로그램 종료 후에도 좀비처럼 남을 수 있음
-
----
-
-### **_run_one() — Deep Agent 생성 + 환경 생성**
-
-> `main.py` → `ThreadPoolExecutor` → 🟢 **`_run_one()`** → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
-
-각 스레드에서 Deep Agent 2개 + 환경을 생성하고, 시뮬레이션 루프를 실행.
-
-```python
-def _run_one(personality_name, tqdm_position=0,
-             reflection_override=None, name_suffix=""):
-    # ── Deep Agent 생성 (배치 결정용) ──
-    decision_agent = create_deep_agent(
-        model=f"openai:{MODEL_DECISION}",        # gpt-4.1-mini
-        tools=[],
-        system_prompt=batch_template,             # 성향 + 행동 목록 포함
-        name=f"decision_{personality_name}",
-    )
-
-    # ── Reflection용 Deep Agent (고급 모델) ──
-    reflection_agent = create_deep_agent(
-        model=f"openai:{MODEL_REFLECTION}",       # gpt-4.1
-        tools=[],
-        system_prompt="당신은 회사원 시뮬레이션의 전략 컨설턴트입니다.",
-        name=f"reflection_{personality_name}",
-    )
-
-    # ── 환경 생성 (동일 시드) ──
-    env = CompanyEnvironment(seed=EXPERIMENT_SEED,
-                             personality=personality,
-                             max_days=MAX_DAYS)
-```
-
-- `create_deep_agent()`: LangChain Deep Agents로 에이전트 생성
-- 배치 결정용(gpt-4.1-mini)과 Reflection용(gpt-4.1) 두 개의 에이전트를 분리
-- 환경은 기존과 동일하게 `CompanyEnvironment` 사용
-
----
-
-### **매일 루프 — 시뮬레이션의 심장**
-
-> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → 🟢 **`매일 루프`** → `agent.invoke()` → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
-
-7,300번 루프를 도는 시뮬레이션 핵심.
-
-```python
-state = env.reset()
-memory = EpisodicMemory(capacity=50)
-history: list[dict] = []
-pending_actions: list[str] = []
-last_reflection_day = 0
-reflection_text = ""
-
-for day in range(1, MAX_DAYS + 1):
-    is_weekend = (day - 1) % 7 >= 5
-```
-
-**주말이면:**
-
-```python
-    if is_weekend:
-        state, full_observation, action = env.step_weekend()
-```
-
-- LLM 호출 없이 성향별 가중치로 활동을 자동 선택
-
-**평일이면:**
-
-```python
-    else:
-        if not pending_actions:              # 30일 계획이 소진됐으면
-            # Reflection 체크 (90일마다)
-            if (reflection_agent
-                    and day - last_reflection_day >= REFLECTION_INTERVAL):
-                reflect_result = reflection_agent.invoke(
-                    {"messages": [
-                        {"role": "system", "content": reflect_prompt},
-                        {"role": "user", "content": "성찰을 시작하세요."},
-                    ]},
-                )
-                reflection_text = _extract_text(reflect_result["messages"][-1])
-                last_reflection_day = day
-
-            # 30일치 행동 계획 생성 (Deep Agent invoke)
-            batch_result = decision_agent.invoke(
-                {"messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": observation},
-                ]},
-            )
-            response_text = _extract_text(batch_result["messages"][-1])
-            pending_actions = _parse_batch(response_text, remaining)
-
-        action = pending_actions.pop(0)      # 오늘 행동 하나 꺼내기
-        state, full_observation = env.step(action)
-```
-
-- 기존의 `agent.reflect()`, `agent.decide_batch()` 메서드 대신 `agent.invoke()`로 호출
-- `_extract_text()`: Deep Agent 응답에서 텍스트를 추출하는 헬퍼 (content가 리스트로 올 수 있음)
-- 나머지 로직(배치 소진 체크, pop, 환경 step)은 기존과 동일
-
----
-
-### **agent.invoke() — 30일 행동 계획 생성**
-
-> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → `매일 루프` → 🟢 **`agent.invoke()`** → `_build_memory_section()` → `env.step()` → `_store_episode_if_important()`
-
-Deep Agent에 시스템 프롬프트 + 현재 상태를 전달하고, 30일치 행동 계획을 받아옴:
-
-```python
-# ① 메모리 3계층을 텍스트로 조합
-memory_section = _build_memory_section(memory, reflection_text, history, llm_compress)
-
-# ② 시스템 프롬프트 조립 (성향 + 메모리 + 행동 목록)
-system_prompt = batch_template.format(
-    n=remaining, actions=_actions_list(), memory_section=memory_section,
-)
-
-# ③ Deep Agent invoke — LLM 호출
-batch_result = decision_agent.invoke(
-    {"messages": [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": observation},
-    ]},
-)
-
-# ④ 응답에서 텍스트 추출 + 파싱
-response_text = _extract_text(batch_result["messages"][-1])
-pending_actions = _parse_batch(response_text, remaining)
-```
-
-| 단계 | 설명 |
-|------|------|
-| ① 메모리 조합 | 에이전트의 기억을 프롬프트용 텍스트로 조합 |
-| ② 프롬프트 조립 | 성향 + 메모리 + 행동 목록을 합쳐서 시스템 프롬프트 생성 |
-| ③ Deep Agent invoke | `create_deep_agent()`로 만든 에이전트에 invoke 호출 |
-| ④ 응답 파싱 | "Day 1: 야근한다" 같은 패턴을 파싱해서 행동 리스트로 변환 |
-
----
-
-### **_build_memory_section() — 3계층 메모리**
-
-> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → 🟢 **`_build_memory_section()`** → `env.step()` → `_store_episode_if_important()`
-
-프롬프트에 들어가는 에이전트의 기억을 3계층으로 조합:
-
-```python
-def _build_memory_section(memory, reflection, history, llm_compress):
-    parts = []
-
-    # 1층: Reflection 결과 (최우선 전략 지침)
-    if reflection:
-        parts.append(
-            "[!][!][!] 최우선 전략 지침 (자기성찰 결과) [!][!][!]\n"
-            "아래 처방된 행동 배분을 반드시 따르세요.\n"
-            f"{reflection}\n"
-            "[!] 위 처방을 무시하고 성향대로만 행동하면 해고됩니다."
-        )
-
-    # 2층: 에피소딕 메모리 (최근 중요 사건 10개)
-    memory_text = memory.to_text(n=10)
-    if memory_text != "기억 없음":
-        parts.append(f"[ 과거 주요 경험 ]\n{memory_text}")
-
-    # 3층: 히스토리 압축 (최근 30일 행동 패턴 요약)
-    if len(history) >= 30:
-        summary = compress_history(history, llm_compress, window=30)
-        if summary:
-            parts.append(f"[ 최근 행동 패턴 요약 ]\n{summary}")
-
-    return "\n\n".join(parts)
-```
-
-| 계층 | 내용 | 역할 |
-|------|------|------|
-| 1층 | Reflection 결과 | `[!][!][!]` 최우선 전략 지침 (이걸 왜 이렇게 강하게 했는지는 Reflection 심화에서 설명) |
-| 2층 | 에피소딕 메모리 | 승진, 해고 위기 등 중요 사건만 기억 (최대 50개 중 최근 10개) |
-| 3층 | 히스토리 압축 | 최근 30일 행동을 LLM이 3문장으로 요약 |
-
-→ 이 세 계층이 합쳐져서 배치 결정 프롬프트의 시스템 메시지에 들어감
-
----
-
-### **왜 Deep Agents 내장 메모리를 사용하지 않았는가?**
-
-**이 프로젝트의 메모리 방식:**
-
-코드가 매일 시뮬레이션 결과를 확인하고, 중요 사건(승진, 해고 위기, 이벤트 등)만 **직접 선별**하여 `EpisodicMemory`에 저장한다. 저장된 기억은 다음 배치 결정 시 프롬프트에 **강제 주입**된다.
-
-```
-매일 루프 → 코드가 사건 분류 → 중요하면 저장 → 다음 LLM 호출 시 프롬프트에 삽입
-```
-
-**Deep Agents가 제공하는 메모리와의 비교:**
-
-| | 이 프로젝트 (커스텀) | Deep Agents Short-term | Deep Agents Long-term |
-|---|---|---|---|
-| 저장소 | Python 리스트 (EpisodicMemory) | LangGraph State (임시 파일) | LangGraph Store (영속) |
-| 누가 관리 | **코드가 직접** 선별/저장/주입 | 에이전트(LLM)가 알아서 | 에이전트(LLM)가 알아서 |
-| 수명 | 시뮬레이션 1회 내 | 대화 스레드 1개 내 | 대화 간 영속 |
-| 용도 | "365일차에 승진했다" 같은 사건 기록 | 작업 중 메모/초안 저장 | 사용자 선호도/지식 저장 |
-| 선별 정확도 | 100% (조건문으로 판별) | LLM 판단에 의존 | LLM 판단에 의존 |
-
-**사용하지 않은 이유:**
-
-1. **정확도** — 이 프로젝트는 `스트레스 >= 80 and 체력 <= 15` 같은 정확한 조건으로 중요 사건을 판별해야 한다. LLM에게 맡기면 놓치거나 잘못 판단할 수 있다.
-2. **비용** — Deep Agents 메모리는 LLM이 매번 "이 사건을 저장할까?" "어떤 기억을 읽을까?" 판단하므로 7,300일 × 추가 호출이 발생한다.
-3. **FIFO 50개 제한** — 코드가 리스트로 관리하면 한 줄이지만, LLM에게 "50개만 유지해"를 시키면 실수할 수 있다.
-4. **용도 불일치** — Short-term은 "작업 중 메모", Long-term은 "대화 간 기억"인데, 이 프로젝트는 "시뮬레이션 중 실시간 사건 기록 → 프롬프트 주입"이라 설계 목적이 다르다.
-
-> **결론: "코드로 확실하게 할 수 있는 건 코드로 한다"** — Reflection 심화에서 얻은 교훈과 같은 맥락이다. LLM에게 부탁하는 것보다 코드가 직접 처리하는 것이 정확하고 저렴하다.
-
----
-
-### **env.step() — 환경 처리 (하루)**
-
-> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → `_build_memory_section()` → 🟢 **`env.step()`** → `_store_episode_if_important()`
-
-`env.step()`이 하루를 처리:
-
-```python
-def step(self, action):
-    effects = ACTION_EFFECTS[action]
-    self._apply_effects(effects, action)    # ① 행동 효과 적용
-    self._apply_daily_drift()               # ② 자연 회복/저하
-    events = roll_events(self.rng, ...)     # ③ 랜덤 이벤트 판정
-    for event in events:
-        self._apply_effects(event.effects)
-    self.state.clamp_all()                  # ④ 스탯 0~100 범위 제한
-    # ⑤ 번아웃/만성스트레스/해고/승진/이직 판정
-```
-
-| 단계 | 설명 |
-|------|------|
-| ① 행동 효과 | 성향별 배율 곱셈. ex) 성과형이 야근하면 성과 1.5배, 사교형은 0.8배 |
-| ② 자연 변화 | 매일 소폭 변동. 체력은 조금씩 회복, 상사신뢰는 조금씩 하락 |
-| ③ 랜덤 이벤트 | 회사(0.2%/일), 팀(1.2%/일), 개인(4%/일) 3티어. 성향별 가중치 다름 |
-| ④ 클램핑 | 모든 스탯 0~100 범위 제한 |
-| ⑤ 생존 판정 | 번아웃, 해고, 승진, 이직 확인 |
-
----
-
-### **_store_episode_if_important() — 메모리 저장**
-
-> `main.py` → `ThreadPoolExecutor` → `_run_one()` → `create_deep_agent()` → `매일 루프` → `agent.invoke()` → `_build_memory_section()` → `env.step()` → 🟢 **`_store_episode_if_important()`**
-
-매일 행동과 결과를 히스토리에 기록하고, **중요한 날만** 에피소딕 메모리에 저장:
-
-```python
-def _classify_outcome(state, observation):
-    if "승진!" in observation:  return f"승진: {state.position}"
-    if "이직!" in observation:  return f"이직 (연봉 {state.salary:,}원)"
-    if state.is_fired:          return "해고됨"
-    if state.is_resigned:       return "자진퇴사"
-    if state.events_today:      return f"이벤트: {', '.join(state.events_today)}"
-    if state.stress >= 80 and state.energy <= 15:
-                                return "번아웃 위기"
-    if state.performance < 15 and state.boss_favor < 15:
-                                return "해고 위기"
-    return None                 # 평범한 날 → 저장 안 함
-```
-
-- 승진, 이직, 해고, 이벤트, 번아웃 위기, 해고 위기 — 이 6가지에 해당하면 저장
-- 20년치를 다 저장하면 프롬프트가 너무 길어지고 의미도 없음
-- 오래된건 FIFO로 밀려남, 메모리 50개만 유지
-
----
-
-### **종료 판정**
-
-> `main.py` → `_run_one()` → 🟢 **`매일 루프 끝`**
-
-```python
-    if not state.is_alive:
-        break               # 해고/퇴사 → 루프 종료
-```
-
-매일 for문 끝에서 `state.is_alive` 확인 (해고, 퇴사한 경우 루프 빠져나옴)
-
-20년을 버텨서 루프가 자연종료되면 정년퇴직
-
----
-
-## **Reflection 심화**
-
-### 구현과정 요약
-
-| 단계 | 구현 | 실험 결과 |
-| --- | --- | --- |
-| **1** | 기본 구조 (단순 프롬프트 + 30일 주기) | Reflect가 오히려 역효과 (5년 vs 6년) |
-| **2** | 수치 제공 + 주기 90일 + 처방 형식 | 여전히 동일 (둘 다 5년 해고) |
-| **3** | 프롬프트 3곳 강화 (`[!][!][!]`, 강제 원칙) | 야근 남발 → 번아웃 악순환 |
-| **4** | 체력/스트레스 관리 원칙 + 희망퇴직 경고 | 17년 부장 vs 5년 사원 |
-
-### **1단계: 기본 구조 구현 → Reflection이 오히려 역효과**
-
-```python
-[ 구조 ]
-매 30일 배치 결정 전 → reflection_agent.invoke() 호출 (gpt-4.1)
-→ 성찰 결과를 reflection_text에 저장
-→ decision_agent.invoke() 호출 (gpt-4.1-mini) → 프롬프트에 [ 자기성찰 결과 ] 포함
-
-# 1단계 Reflection 프롬프트 (단순)
-"지난 30일간의 행동을 돌아보고 개선점을 제안하세요.
- 다음 기간에 적용할 전략 변경 1~2가지를 제시하세요."
-```
-
-먼저 Reflection의 뼈대를 구축
-
-핵심은 모델을 두 개로 나누어 실행. 성찰은 gpt-4.1(고품질), 행동 결정은 gpt-4.1-mini(저렴).
-
-성찰이 높은 수준의 판단을, 배치 결정이 구체적인 실행을 담당하는 구조
-
-**결과** : Reflection이 있는 쪽이 오히려 더 빨리 해고
-
-> [1위] 정치형_NoReflect | 사원 | 생존 2,279일 (6년) | 해고
-> [2위] 정치형_Reflect   | 사원 | 생존 1,958일 (5년) | 해고
-
-**원인**
-
-1. 성찰 내용이 추상적 : 매번 "업무 성과가 위험합니다, 성과를 올리세요"라는 동일한 일반론만 반복. 구체적으로 어떤 스탯이 얼마나 부족한지, 어떤 행동을 며칠 해야 하는지를 모름.
-2. 전략을 너무 자주 흔듦 : 30일마다 성찰하면서 방향을 계속 바꿈. NoReflect는 성향대로 일관되게 행동해서 오히려 안정적.
-3. 정치형의 근본 문제를 못 건드림 : 정치형이 해고되는 핵심 원인은 평판이 0이라 대리 승진을 못 하는 것. "성과를 올려라"라는 추상적 조언으로는 평판 문제를 해결 불가.
-
----
-
-### **2단계: 수치 + 주기 + 형식 개선 → 여전히 동일**
-
-**개선** : 세가지 모두 수정
-
-1. 승진 요건 갭 수치를 프롬프트에 제공
-
-    ```python
-    현재 직급: 사원 → 다음 승진 요건:
-      업무능력: 15 / 22 (부족 7)
-      성과: 20 / 30 (부족 10)
-      상사신뢰: 80 / 40 (충족 ✓)
-      평판: 5 / 20 (부족 15)       ← 병목이 한눈에 보임
-
-    [!] 경력 5년 해고심사까지 625일 남음 — 그때까지 대리 이상 필수!
-    ```
-
-    _build_promotion_gap() 함수를 만들어서, 현재 스탯과 승진 요건의 차이를 수치로 보여줌
-
-    "평판이 부족하다"가 아니라 **"평판 5인데 20 필요하다, 15 부족하다"**를 알려줌
-
-2. 성찰 주기 30일 → 90일
-
-    너무 자주 성찰하면 전략이 흔들리니까, 분기(90일)마다 한 번으로 감소
-
-3. 출력 형식을 처방 형태로 구체화
-
-    ```python
-    # 기존 출력
-    "다음 기간에 적용할 전략 변경 1~2가지"
-
-    # 변경된 출력
-    처방: 다음 90일 행동 배분 (30일 기준):
-    - 동료를 도와준다 15일 (평판 집중)
-    - 프로젝트에 집중한다 10일 (업무능력+성과)
-    - 상사와 점심을 먹는다 5일 (상사신뢰 유지)
-    합계 30일.
-    ```
-
-**결과** : 둘 다 5년차 사원 승진미달 해고
-
-> [1위] 정치형_NoReflect | 사원 | 생존 1,825일 (5년) | 해고
-> [2위] 정치형_Reflect   | 사원 | 생존 1,825일 (5년) | 해고
-
-**원인** : 구조적 문제
-
-1. Reflection 결과를 너무 약하게 전달 : 성찰 결과는 [ 자기성찰 결과 ]라는 텍스트로 프롬프트에 포함되는데, 같은 프롬프트에 성향 설명도 있음. gpt-4.1-mini가 성향 설명을 더 우선시해서 결국 같은 행동 패턴이 나옴.
-2. Reflection 내용이 행동으로 강제되지 않음 : Reflection은 그냥 참고용 텍스트일 뿐, 실제 행동을 바꾸는 메커니즘이 없음. NoReflect도 현재 스탯을 보고 알아서 판단하니까 결과적으로 거의 동일한 행동을 선택.
-
-→ Reflection LLM(gpt-4.1)이 아무리 좋은 분석을 해도, 배치 결정 LLM(gpt-4.1-mini)이 그걸 무시하면 의미 없음
-
----
-
-### **3단계: 프롬프트 3곳 동시 강화 → 야근 남발 악순환**
-
-**개선** : 근본적인 프롬프트 개선
-
-1. Reflection 프롬프트 전면 재설계
-
-    ```python
-    # 역할을 "자기성찰 모듈" → "전략 컨설턴트"로 격상
-    REFLECTION_PROMPT = """
-    당신은 회사원 시뮬레이션의 전략 컨설턴트입니다.
-    ...
-    [!] 중요: 성향에 맞는 행동만 반복하면 특정 스탯만 올라가고
-    승진 요건을 못 채워 해고됩니다.
-    성향과 다른 행동이라도 생존을 위해 반드시 필요합니다.
-    ```
-
-    - 행동별 효과 참고표를 추가해서, "동료를 도와준다 → 평판↑", "정치적으로 행동한다 → 평판에 도움 안됨" 을 명시
-    - "성향에 맞는 행동만 반복하면 해고된다"는 경고를 Reflection 프롬프트에도 추가
-
-2. memory_section에서 Reflection 격상
-
-    ```python
-    # 기존
-    parts.append(f"[ 자기성찰 결과 ]\n{reflection}")
-
-    # 변경
-    parts.append(
-        "[!][!][!] 최우선 전략 지침 (자기성찰 결과) [!][!][!]\n"
-        "아래 처방된 행동 배분을 반드시 따르세요. "
-        "성향과 다르더라도 생존을 위해 필수입니다.\n"
-        f"{reflection}\n"
-        "[!] 위 처방을 무시하고 성향대로만 행동하면 해고됩니다."
-    )
-    ```
-
-    단순 참고 텍스트에서 → `[!][!][!]` 태그 + "반드시 따르세요" + "무시하면 해고됩니다"로 강화.
-
-3. 배치 결정 프롬프트에 강제 원칙 추가
-
-    ```python
-    # BATCH_SYSTEM_PROMPT에 추가
-    [!] 핵심 원칙: "최우선 전략 지침"이 위에 있다면,
-    그 처방된 행동 배분을 반드시 따르세요.
-    성향에 맞는 행동만 반복하면 특정 스탯만 편중되어
-    승진 요건을 못 채우고 해고됩니다.
-    ```
-
-    배치 결정 LLM(gpt-4.1-mini) 자체에도 "Reflection 지침을 따르라"는 명시적 지시를 추가
-
-**결과**
-
-> 정치형_Reflect   | 대리 | 생존 1,112일 (3년) | 만성 스트레스 퇴사
-> 정치형_NoReflect | 대리 | 생존 1,825일 (5년) | 정년퇴직
-
-**원인**
-
-- 야근 남발 악순환
-Reflection이 "성과 부족! 프로젝트 집중해! 야근해!" 라고 처방 → 배치 결정 LLM이 처방을 따름 → 성향과 반대되는 고강도 행동을 연속 실행 → **스트레스 폭증, 체력 바닥 → 만성 스트레스 퇴사
-- 처방 : 승진 요건만 보고 스트레스/체력 관리를 무시
-야근하면 성과는 오르지만 스트레스↑ 체력↓ → 부정적 이벤트 증가 → 성과가 오히려 하락하는 악순환을 Reflection이 이해 못함
-
----
-
-### **4단계: 체력/스트레스 관리 원칙 추가 → 최종 성공**
-
-**개선** : 생존 관련 안전장치 추가
-
-1. 희망퇴직 확률 경고 (구체적 수치)
-
-    ```
-    - 희망퇴직: 경력 12년+ 시 자발적 퇴직 가능성
-      [!] 스트레스가 높고 체력이 낮으면 희망퇴직 확률이 크게 상승한다!
-      스트레스 80+ → 퇴직확률 +15%, 체력 20 이하 → +10%
-      반대로 스트레스 20 이하, 체력 80 이상이면 퇴직 욕구가 크게 감소한다.
-    - 번아웃: 스트레스 90+ AND 체력 10 이하 30일 지속 → 자진퇴사
-    ```
-
-    Reflection LLM에게 "스트레스/체력 상태에 따라 퇴직 확률이 달라진다"는 걸 구체적 수치로 알려줌
-
-2. 체력/스트레스 관리 필수 원칙 (별도 섹션)
-
-    ```
-    [!][!] 체력/스트레스 관리 필수 원칙 [!][!]
-    - 체력 30 이하 또는 스트레스 70 이상이면 반드시 휴가를 처방에 포함하세요.
-    - 야근은 스트레스를 급격히 올리고 체력을 깎으므로,
-      스트레스 50 이상일 때는 절대 처방하지 마세요.
-    - 장기 생존이 승진보다 중요합니다. 죽으면 승진도 없습니다.
-    ```
-
-    "승진보다 생존이 먼저다"를 명시적 원칙으로 추가
-
-3. 행동 효과 강조도 변경
-
-    ```
-    # 기존
-    - 야근한다: 스트레스↑ 체력↓
-    - 휴가를 쓴다: 스트레스↓ 체력↑
-
-    # 변경
-    - 야근한다: 스트레스↑↑ 체력↓↓ — 남용 금지!
-    - 휴가를 쓴다: 스트레스↓↓ 체력↑↑ (생존 핵심!)
-    ```
-
-    야근의 부작용과 휴가의 중요성을 훨씬 강하게 표현
-
-결과
-
-> 정치형_Reflect   | 부장 | 연봉 1.3억 | 생존 6,206일 (17년) | 희망퇴직 (자발적)
-> 정치형_NoReflect | 사원 | 연봉 4,100만 | 생존 1,825일 (5년)  | 권고사직 (강제)
-
-- NoReflect는 이전과 동일 : 정치 행동만 반복하다 평판 바닥으로 5년차에 권고사직
-- Reflect는 17년차에 희망퇴직 : 스트레스 37, 체력 80 상태에서 자발적으로 퇴직한거라, 나쁜 결말이 아님
-Reflection이 "평판 0.2인데 12 필요하다, 동료를 도와줘서 올려라"고 처방하고,
-decision_agent(gpt-4.1-mini)가 그걸 실제로 따름.
-→ 정치 일변도에서 벗어나 평판을 보완하면서도, 체력/스트레스 관리 원칙 덕분에 번아웃 없이 안정적으로 성장
-
----
-
-### 핵심
-
-1. Reflection에 구체적인 수치를 제공해야 한다. (1→2단계)
-→ "잘해라"가 아니라 "평판 5인데 20 필요, 15 부족"을 알려줘야함
-2. Reflection 결과를 텍스트로만 전달하면 의사결정 모델이 무시할 수 있다. (2→3단계)
-→ 특히 저비용 모델(mini)일수록 긴 시스템 프롬프트의 지시를 놓침 (강제 지시 태그와 배치 프롬프트 보강 필요)
-3. 승진만 보면 안 됨. 생존 원칙이 필요하다. (3→4단계)
-→ "성과 올려라 → 야근 → 번아웃"의 악순환. Reflection이 승진과 생존을 동시에 고려하게 만들어야함
-4. 그래도 근본적 한계는 있다
-→ 이 모든 수정은 전부 **프롬프트 텍스트 강화**, gpt-4.1-mini가 지시를 따를지는 여전히 모델 판단에 의존
-진짜 확실하게 하려면 **구조적으로 행동에 영향을 미치는 설계** 필요
-ex. Reflection 결과로 행동 확률 가중치를 직접 수정하거나, 특정 행동을 강제로 n일 예약하는 방식
-
-**→ LLM에게 "하라고 텍스트로 말하는 것"과 "구조적으로 하게 만드는 것"은 다르다.**
-
----
-
-### "구조적으로 하게 만드는 것"이란?
-
-현재 방식은 프롬프트에 "휴가를 5일 넣으세요"라고 텍스트로 지시 → LLM이 무시할 수 있음
-
-구조적 방식은 코드가 직접 행동 계획을 수정하는 것:
-
-```
-[현재] 프롬프트 강화 방식
-Reflection → "체력 위험, 휴가 5일 필요" (텍스트)
-  → decision_agent.invoke() 프롬프트에 삽입
-  → LLM이 따를 수도 있고, 무시할 수도 있음
-
-[개선] 구조적 강제 방식
-Reflection → {"휴가를 쓴다": 5, "동료를 도와준다": 10} (구조화된 데이터)
-  → decision_agent.invoke()에서 LLM이 30일 계획 생성
-  → 코드가 후처리로 "휴가 최소 5일" 조건을 강제 보정
-  → LLM 판단과 무관하게 반드시 실행됨
-```
-
-핵심 차이: LLM에게 **부탁**하는 것이 아니라, 코드가 **직접** 행동을 바꾸는 것
-
-이를 위해 추가되어야 하는 것:
-
-1. **Reflection 프롬프트 수정** — LLM이 텍스트가 아닌 JSON으로 처방을 반환하도록 변경
-```
-기존: "체력이 위험합니다. 휴가를 5일 정도 넣으세요."
-변경: {"휴가를 쓴다": 5, "동료를 도와준다": 10, "프로젝트에 집중한다": 15}
-```
-
-2. **파싱 함수 추가** — LLM이 반환한 JSON을 코드가 읽을 수 있는 데이터로 변환
-```python
-def parse_quota(response) -> dict:
-    # "{"휴가를 쓴다": 5, ...}" → 파이썬 딕셔너리로 변환
-```
-
-3. **보정 함수 추가** — LLM이 만든 30일 계획을 처방 기준으로 강제 수정
-```python
-def enforce_quota(actions, quota) -> list:
-    # LLM이 휴가를 2일만 넣었으면 → 3일을 강제로 교체
-    # quota에 명시된 최소 일수를 반드시 충족시킴
-```
-
----
-
-# 4. MCP 연동 — 공식 vs 직접 구현 비교
-
-> **이 브랜치(`feature/mcp-confluence-official`)는 두 가지 MCP 연동 방식 중 "공식/기존 MCP 서버 사용" 버전을 구현하기 위한 작업 브랜치입니다.**
->
-> 비교 대상 브랜치: `feature/mcp-confluence-custom` (MCP 서버 직접 구현)
->
-> 최종 목표: 두 구현을 같은 use case에 대해 적용하고, 토큰/호출수/실패율/코드량 등을 정량 비교하여 트레이드오프를 코드리뷰로 정리한다.
-
-## 왜 Confluence인가
-
-기업이 Confluence를 AI/에이전트에 연결하는 핵심 이유는 **"흩어진 사내 지식을 LLM이 직접 활용 가능한 형태로 만드는 것"**입니다:
-
-1. **사내 지식의 단일 진실 공급원(SSOT)** — 제품 스펙, ADR, 운영 매뉴얼, 회의록이 모이는 곳
-2. **정보 탐색 비용 절감** — "이 정책 뭐야?", "작년 결정 이유?" 같은 질문을 즉답
-3. **개발자 컨텍스트 주입** — 사내 컨벤션·런북·보안 정책을 코딩 에이전트에 주입
-4. **온보딩/헬프데스크 자동화** — 신입의 반복 질문 처리
-5. **거버넌스/컴플라이언스** — 일반 LLM 답변이 아닌 사내 규정 기반 답변
-6. **권한 모델 재사용** — Confluence의 SSO + 페이지 권한을 그대로 활용
-
-이 시뮬레이션 맥락에서는 다음과 같이 매핑됩니다:
-
-| 일반 기업 사용처 | 시뮬레이션 매핑 |
+| 파일 | 역할 |
 |---|---|
-| SSOT (1번) | "회사 규정 / 승진 요건"을 위키에 두고 에이전트가 참조 |
-| 거버넌스 (5번) | "성향별 행동 가이드"가 위키에서 정책처럼 동작 |
-| 양방향 활용 (7번 류) | 에이전트의 Reflection 결과를 위키 페이지로 누적 → 다음 분기에 읽음 |
+| [confluence_official.py](confluence_mcp/confluence_official.py) | MCP 클라이언트 wrapper. save/fetch 함수 2개 노출 |
+| [main.py](main.py) | 시뮬레이션 본체. Reflection 시점 전후로 wrapper 호출만 추가 |
+| [test_mcp.py](confluence_mcp/test_mcp.py) | MCP 연결 자체 sanity check |
+| [test_mcp_schema.py](confluence_mcp/test_mcp_schema.py) | mcp-atlassian이 노출한 도구의 인자 스키마 일괄 출력 |
+| [test_confluence_official.py](confluence_mcp/test_confluence_official.py) | wrapper save→fetch 한 사이클 단독 검증 |
+| [test_integration_small.py](test_integration_small.py) | main.py + Confluence 통합 스모크 (200일/1성향) |
+
+### 2-2. 호출 흐름 (Reflection 1회 발생 시)
+
+```
+시뮬레이션 진행
+   │
+   ├─ Day N에서 90일 지났음, history 누적 충분 → Reflection 트리거
+   │
+   ├─ [1] confluence_official.fetch_past_reflections_text(agent_name, limit=3)
+   │      └─ get_page_children(parent_id=120520708) → results 필터링/정렬 → 텍스트 N개
+   │
+   ├─ [2] reflection_prompt에 "[ 과거 Reflection 기록 ]" 섹션으로 주입
+   │
+   ├─ [3] reflection_agent.invoke(...) → LLM이 새 처방 생성
+   │
+   ├─ [4] _parse_quota(reflection_text) → JSON quota 추출
+   │
+   └─ [5] confluence_official.save_reflection(agent_name, day, text, quota, run_id=timestamp)
+          └─ create_page(parent_id, title="Reflection_{agent}_Day{NNNN}_{run_id}", content=markdown)
+```
+
+### 2-3. 스레드 모델
+
+`main.py`는 5명의 에이전트(성향)를 `ThreadPoolExecutor`로 동시에 돌린다. mcp-atlassian은 stdio transport(서브프로세스)이고 stdio는 thread-safe하지 않으므로 **워커 스레드마다 별도의 mcp-atlassian 서브프로세스 + 별도 asyncio 이벤트 루프**를 둔다. 이는 `threading.local()`과 첫 호출 시 lazy init 패턴으로 구현된다 (`confluence_official._ensure_init`).
+
+> 트레이드오프: 스레드별 init 첫 호출은 2~3초가 걸린다. 다만 이후 호출은 같은 서브프로세스를 재사용하므로 반복 호출 비용은 무시할 수준.
 
 ---
 
-## 공식 MCP — "데이터 접근 레이어"
+## 3. 지금 코드가 실제로 하는 일
 
-공식 MCP는 Confluence의 데이터 모델을 거의 그대로 노출합니다:
+`confluence_official.py`는 **24개 중 2개의 도구만** 사용한다.
 
-```
-search_pages(query, space)
-get_page(id)
-create_page(space, title, content, parent_id)
-update_page(id, content, version)
-add_comment(page_id, body)
-```
-
-Confluence의 모든 기능을 사용 가능하게 해주는 **얇은 래퍼**.
-
-이걸 시뮬레이션에 갖다 붙이면 LLM이 매번 이런 일을 직접 해야 합니다:
-
-**시나리오 A — "정치형 에이전트의 직전 성찰을 가져와라"**
-1. `search_pages(query="성찰 정치형", space="SIM")` → 페이지 5개 메타데이터
-2. LLM이 제목 보고 가장 최근 거 고름 (날짜 파싱 실패 가능)
-3. `get_page(id=...)` → 페이지 전체 HTML/Markdown 반환 (보통 2~5천 토큰)
-4. LLM이 본문에서 처방 JSON 블록을 다시 파싱
-
-**시나리오 B — "이번 분기 성찰을 저장해라"**
-1. LLM이 적절한 부모 페이지 ID를 알아내야 함
-2. 제목 컨벤션을 LLM이 매번 만들어냄 → 중복/오타 발생 위험
-3. 본문 템플릿도 LLM이 매번 구성 → 다음에 읽을 때 파싱 실패 가능
-4. quota JSON을 본문에 박아넣으면, 읽을 때 또 정규식 파싱
-
-→ **비즈니스 로직(성찰을 어디에/어떻게 저장하고 어떻게 찾을지)이 전부 LLM의 추론에 위임됨.** 토큰도 비싸고, 매 호출마다 실수할 여지가 있다.
-
----
-
-## 직접 만든 MCP — "도메인 서비스 레이어"
-
-직접 만들면 도구를 **시뮬레이션 도메인 언어**로 정의 가능:
-
-```
-get_personality_guide(personality)            # 성향 가이드 한 섹션만
-get_company_policy(category)                  # "승진요건" / "행동효과" 등
-get_recent_reflections(personality, n=3)      # 최근 N개, 시간순 정렬
-save_reflection(personality, day, quota, prescription_text, summary)
-get_episodic_memory(personality, outcome_filter="해고|승진")
-record_career_event(personality, day, event_type, snapshot)
-```
-
-같은 두 시나리오가 이렇게 바뀝니다:
-
-**시나리오 A'**
-- `get_recent_reflections(personality="정치형", n=1)` → 처방 quota(이미 파싱된 dict) + 요약 텍스트만 반환, ~300 토큰
-- LLM은 검색·선택·파싱 단계가 모두 사라짐
-
-**시나리오 B'**
-- `save_reflection(personality="정치형", day=270, quota={...}, ...)`
-- 서버가 페이지 위치(`/시뮬레이션/정치형/성찰/Day 270`), 제목, 템플릿, quota를 page properties로 별도 저장 — 모두 자동
-- 잘못된 성향명이면 서버가 거부 → LLM이 빨리 알아챔
-
----
-
-## 트레이드오프 요약
-
-| 관점 | 공식 MCP | 직접 만든 MCP |
+| wrapper 함수 | 호출하는 MCP 도구 | 사용 시점 |
 |---|---|---|
-| **추상화 수준** | Confluence 데이터 모델 | 시뮬레이션 도메인 모델 |
-| **도구 개수** | 적고 범용 | 많고 구체적 |
-| **LLM이 떠안는 추론** | 많음 (위치·포맷·파싱) | 적음 (의사결정만) |
-| **토큰 효율** | 페이지 전체 반환 | 필요한 필드만 반환 |
-| **에러 표면** | Confluence 400/404 그대로 | 도메인 에러 ("성향명 오류") |
-| **개발 비용** | 0 (붙이기만) | 서버 구현·유지보수 필요 |
-| **확장성** | Confluence 모든 기능 사용 가능 | 노출한 기능만 가능 |
-| **변경 영향** | Confluence API 변경 시 자동 흡수 | 직접 따라가야 함 |
+| `save_reflection(agent, day, text, quota, run_id)` | `confluence_create_page` | 매 Reflection 직후 |
+| `fetch_past_reflections_text(agent, limit)` | `confluence_get_page_children` | 매 Reflection 직전 |
+
+### 페이지 제목 규약
+
+```
+Reflection_{agent_name}_Day{day:04d}[_{run_id}]
+예: Reflection_DeepAgent_정치형_Day0090_260423_102135
+```
+
+- `Day{day:04d}` 4자리 zero-padding → 문자열 정렬도 시간 순서 유지
+- `run_id`(시뮬레이션 시작 timestamp)를 suffix로 붙여 **같은 에이전트로 여러 번 돌려도 제목 충돌 없이 공존**
+- 조회는 `Reflection_{agent_name}_Day` prefix만 매칭하므로 run_id가 있어도 자연스럽게 잡힘
+
+### 왜 검색(search)이 아니라 자식 조회(get_page_children)인가
+
+- `confluence_search`는 CQL 토큰화/인덱싱 지연 때문에 **방금 만든 페이지가 즉시 검색되지 않는** 경우가 발생 (실제 디버깅 중 확인됨)
+- `confluence_get_page_children`은 **부모 페이지 트리를 즉시 일관성 있게 반환**
+- 부모 페이지 한 곳에 모든 Reflection을 매다는 구조라면 자식 조회가 더 정확하고 빠르다
+
+대신 자식 조회는 limit이 1~50이라 페이지가 50개를 초과하면 페이지네이션이 필요하다 (현 구현에서는 미처리, [한계](#8-현-구조의-한계-다른-브랜치와의-비교-포인트) 참조).
 
 ---
 
-## 핵심 통찰
+## 4. mcp-atlassian이 노출하는 도구 전수
 
-이건 사실 **소프트웨어 공학의 고전적 긴장**과 똑같습니다:
+`test_mcp_schema.py`가 출력하는 24개 Confluence 도구. **현재 wrapper에서 쓰는 2개 외에 나머지 22개를 그대로 활용 가능하다** (추가 코드 변경 없이 같은 클라이언트로).
 
-- 공식 MCP = **범용 ORM** (DB 위에 얇게)
-- 직접 MCP = **도메인 서비스 (DDD)** (DB 위에 도메인 의미를 입힘)
+| 분류 | 도구 | 용도 (요약) |
+|---|---|---|
+| **페이지 R** | `confluence_get_page` | ID 또는 (제목+space)로 단일 페이지 |
+| | `confluence_get_page_children` ★ | 부모 페이지의 자식 리스트 (현재 사용) |
+| | `confluence_get_space_page_tree` | 스페이스 전체 트리 |
+| | `confluence_search` | CQL 또는 자연어 검색 |
+| **페이지 CUD** | `confluence_create_page` ★ | 새 페이지 생성 (현재 사용) |
+| | `confluence_update_page` | 페이지 수정 |
+| | `confluence_delete_page` | 페이지 삭제 |
+| | `confluence_move_page` | 페이지 이동 |
+| **첨부** | `confluence_upload_attachment` / `_attachments` | 파일 업로드 |
+| | `confluence_download_attachment` | 파일 다운로드 |
+| | `confluence_get_attachments` | 첨부 목록 |
+| | `confluence_delete_attachment` | 첨부 삭제 |
+| | `confluence_download_content_attachments` | 페이지 콘텐츠 + 첨부 일괄 |
+| **댓글** | `confluence_add_comment` | 코멘트 작성 |
+| | `confluence_get_comments` | 코멘트 조회 |
+| | `confluence_reply_to_comment` | 코멘트 응답 |
+| **메타** | `confluence_add_label` / `_get_labels` | 라벨 |
+| | `confluence_get_page_history` | 버전 이력 |
+| | `confluence_get_page_diff` | 버전 간 차이 |
+| | `confluence_get_page_views` | 조회수 |
+| | `confluence_get_page_images` | 본문 내 이미지 |
+| **사용자** | `confluence_search_user` | 사용자 검색 |
 
-범용 도구는 만능이지만 사용처마다 비즈니스 로직을 호출자(여기선 LLM)가 다시 짜야 한다.
-도메인 서비스는 좁지만 호출자의 부담을 크게 줄여준다.
+★ 표시가 현재 wrapper에서 사용 중.
 
-**LLM 시대에 이게 더 중요해진 이유:**
+### 같은 연결로 자연스럽게 확장 가능한 작업 예
 
-- LLM의 "추론 호출"은 비싸고 불안정하다 (확률적, 토큰 비용)
-- 도구 호출 한 번에 결정적으로 끝낼 수 있는 일을 LLM이 3-stage로 추론하면 → 비용·지연·오류율이 다 늘어남
-- 즉, **MCP 서버 쪽에 결정적 로직을 더 많이 둘수록 시스템이 안정·저렴해진다**
-
-이는 섹션 3 마지막의 핵심 교훈과도 정확히 일치합니다:
-
-> **"LLM에게 '하라고 텍스트로 말하는 것'과 '구조적으로 하게 만드는 것'은 다르다"**
-
-공식 MCP는 "텍스트로 부탁"하는 쪽에 가깝고, 직접 만든 MCP는 "구조적으로 강제"하는 쪽에 가깝다.
+- 시뮬레이션 종료 시 결과 요약을 별도 페이지로 저장 (`create_page`)
+- 매 분기 Reflection을 새 페이지 대신 기존 페이지에 append 형태로 누적 (`update_page`)
+- Reflection 페이지에 성향/분기 라벨 부여 → CQL로 카테고리 검색 (`add_label` + `search`)
+- 결과 시각화 HTML/이미지를 페이지에 첨부 (`upload_attachment`)
+- 사람이 단 코멘트를 LLM 컨텍스트로 가져와 다음 Reflection에 반영 (`get_comments`)
 
 ---
 
-## 비교 리뷰 측정 항목
+## 5. 사용 예시 (코드 스니펫)
 
-두 브랜치가 동일한 기능(예: "에이전트의 성찰 read/write")을 구현한 뒤 다음을 정량 비교할 예정:
+### 5-1. 가장 최소: 한 페이지 만들고 한 페이지 읽기
 
-1. **토큰 사용량** — 같은 시나리오 1회당 평균 입출력 토큰
-2. **도구 호출 횟수** — 한 작업 완수에 필요한 LLM ↔ MCP 왕복 횟수
-3. **실패율** — 잘못된 페이지 선택, 파싱 실패, 중복 생성 빈도
-4. **코드량 / 복잡도** — 클라이언트(시뮬레이션) + 서버(MCP) 합계
-5. **변경 비용** — "성찰 저장 형식이 바뀌었다"는 가상 시나리오에서 양쪽이 얼마나 바뀌는지
+```python
+from dotenv import load_dotenv
+from confluence_official import save_reflection, fetch_past_reflections_text
 
-이 데이터가 코드리뷰의 결론을 뒷받침한다.
+load_dotenv()
+
+save_reflection(
+    agent_name="DeepAgent_테스트",
+    day=90,
+    text="평가: 야근 과다.\n처방: 휴가 8일.",
+    quota={"휴가를 쓴다": 8, "프로젝트에 집중한다": 22},
+    run_id="manual_smoke",
+)
+
+print(fetch_past_reflections_text("DeepAgent_테스트", limit=3))
+```
+
+### 5-2. main.py에 통합된 모습 (요지)
+
+```python
+# Reflection 직전
+past_reflections_section = ""
+if USE_CONFLUENCE:
+    past_text = confluence_official.fetch_past_reflections_text(
+        agent_name, limit=PAST_REFLECT_LIMIT,
+    )
+    if past_text:
+        past_reflections_section = f"\n[ 과거 Reflection 기록 (Confluence) ]\n{past_text}\n"
+
+reflect_prompt = REFLECTION_PROMPT.format(
+    ...,
+    past_reflections_section=past_reflections_section,
+)
+
+# LLM이 새 Reflection 생성 후
+if USE_CONFLUENCE:
+    confluence_official.save_reflection(
+        agent_name=agent_name, day=day,
+        text=reflection_text, quota=action_quota,
+        run_id=timestamp,
+    )
+```
+
+핵심: **Confluence 호출은 시뮬레이션 루프의 정해진 자리에 박혀 있고, LLM은 Confluence의 존재를 모른다**. 이게 6장에서 말하는 "code-driven" 패턴이다.
+
+### 5-3. 새 도구 하나 추가하고 싶다면
+
+```python
+# confluence_official.py 안에 추가
+def add_label_to_reflection(page_id: str, label: str) -> bool:
+    tools = _ensure_init()
+    add_label = tools.get("confluence_add_label")
+    if not add_label:
+        return False
+    try:
+        _local.loop.run_until_complete(add_label.ainvoke({
+            "page_id": page_id,
+            "label": label,
+        }))
+        return True
+    except Exception as e:
+        print(f"[Confluence] add_label 실패: {e}")
+        return False
+```
+
+도구 인자명을 모르면 `python test_mcp_schema.py`로 확인.
+
+---
+
+## 6. 통합 패턴 두 가지: code-driven vs LLM-driven
+
+같은 mcp-atlassian 연결을 **누가 호출 결정을 내리느냐**에 따라 두 가지 방식으로 쓸 수 있다.
+
+| | 옵션 B (현재) | 옵션 A |
+|---|---|---|
+| 누가 결정? | Python 코드 | LLM (Deep Agent) |
+| 우리 코드 | `tool.ainvoke({...})` 직접 호출 | Deep Agent의 `tools=[...]`에 도구 그대로 전달 |
+| 호출 시점 | 시뮬레이션 루프의 정해진 자리 | LLM이 매 단계 판단 |
+| 장점 | 결정적, 디버깅 쉬움, 토큰 비용 낮음 | "지금 검색해야겠다" 같은 동적 판단 가능 |
+| 단점 | 새로운 use case마다 코드 수정 필요 | 도구 잘못 호출 위험, 비용 증가, 로깅 복잡 |
+| 적합 | "Reflection 끝나면 무조건 저장" 같은 명확한 시점 | "여러 페이지 중 하나를 LLM이 선택" 같은 의사결정 |
+
+### 옵션 A로 전환하려면
+
+`main.py`에서 `decision_agent`/`reflection_agent` 생성 부분의 `tools=[]` 자리에 MCP 도구 리스트를 넣는다.
+
+```python
+mcp_tools = list(confluence_official._ensure_init().values())
+reflection_agent = create_deep_agent(
+    model=f"openai:{MODEL_REFLECTION}",
+    tools=mcp_tools,  # LLM이 이 도구들을 자율적으로 호출
+    system_prompt="당신은 ... Confluence에 'Reflection_{agent}_Day{N}'으로 저장하세요.",
+    name=f"reflection_{personality_name}",
+)
+```
+
+이때 `_ensure_init`은 메인 스레드에서 한 번 호출되어야 하고, 워커 스레드는 별도 init이 필요하다는 점에 주의 (옵션 A로 가도 스레드 모델은 그대로 적용됨).
+
+> 이 브랜치는 코드리뷰의 공정성을 위해 **옵션 B 한 가지로 통일**한다. 직접 만든 MCP 서버 브랜치도 같은 패턴(B)으로 작성될 예정.
+
+---
+
+## 7. 검증 스크립트 (4개)
+
+| 파일 | 무엇을 검증 | 언제 돌리나 | 외부 호출 |
+|---|---|---|---|
+| [test_mcp.py](confluence_mcp/test_mcp.py) | mcp-atlassian이 떠서 페이지 1개 읽힘 | 인증/연결 의심될 때 가장 먼저 | Confluence read 1회 |
+| [test_mcp_schema.py](confluence_mcp/test_mcp_schema.py) | 24개 도구 인자 스키마 | 라이브러리 업그레이드 후, 새 도구 wrapper 추가 전 | Confluence 도구 메타만 |
+| [test_confluence_official.py](confluence_mcp/test_confluence_official.py) | save→fetch 한 사이클 (wrapper 단독) | `confluence_official.py` 수정 직후 회귀 | Confluence write 2회 + read 1회 |
+| [test_integration_small.py](test_integration_small.py) | main.py 200일 / 1성향 스모크 | main.py나 wrapper 만진 후 풀 실행 전 | OpenAI API + Confluence write 1~2회 |
+
+각 파일 상단 주석에 같은 정보가 정리되어 있다.
+
+### 실행 (Windows)
+
+콘솔이 cp949일 경우 한글 출력에서 `UnicodeEncodeError`가 난다. UTF-8로 강제:
+
+```bash
+PYTHONIOENCODING=utf-8 PYTHONUTF8=1 python test_confluence_official.py
+```
+
+---
+
+## 8. 현 구조의 한계 (다른 브랜치와의 비교 포인트)
+
+직접 만든 MCP 서버(`feature/mcp-confluence-custom`)와의 코드리뷰에서 짚을 항목들.
+
+### 8-1. 도메인 무지
+
+- mcp-atlassian의 도구는 **일반 CRUD** — "Reflection"이라는 우리 도메인 개념을 모름
+- 그래서 클라이언트가 직접:
+  - 제목 prefix(`Reflection_{agent}_Day`) 규약을 강제
+  - 응답에서 day 번호 파싱 + 내림차순 정렬
+  - 자식 페이지 중 우리 것만 필터링
+- 직접 만든 MCP라면 `save_reflection(agent, day, text)` 같은 도메인 동사를 그대로 노출 가능 → 클라이언트 코드는 단순해지고, 서버가 일관성 보장
+
+### 8-2. 응답 노이즈
+
+- `get_page_children` 응답에 `url`, `version`, `attachments`, `space.name` 등 **우리에게 불필요한 메타데이터**가 같이 옴
+- `_unwrap_text` → `json.loads` → 필드 추출의 파싱 단계가 항상 한 겹 더 들어감
+- 직접 만든 MCP는 도메인에 맞춰 응답을 **반드시 필요한 필드만 깎아서** 줄 수 있음
+
+### 8-3. 인덱싱/일관성 가정
+
+- `confluence_search`는 인덱싱 지연으로 직후 조회 시 빈 결과를 반환할 수 있음 → 우리는 `get_page_children`으로 우회
+- 직접 만든 MCP는 자체 DB/캐시로 **즉시 일관성**을 보장하도록 설계 가능
+
+### 8-4. 페이지네이션 미처리
+
+- `get_page_children`의 `limit`은 1~50. 부모 페이지에 자식이 50개를 넘으면 잘림
+- 5명 에이전트 × 81 reflection (20년) ≈ 405개 자식 → 풀 실행 시 한 번의 호출로 못 가져옴
+- 현 구현은 단일 호출만 사용하므로 정확히 가장 최근 50개 안에 들어야 하는 가정에 의존
+- 직접 만든 MCP라면 "이 에이전트의 최근 N개"라는 도구를 만들어 서버에서 한 번에 처리 가능
+
+### 8-5. 인증/거버넌스
+
+- 공식 Atlassian Remote MCP(OAuth 2.1+PKCE)를 못 쓰고 **API Token**으로 동작 → 토큰 노출 시 영향 범위가 사용자 전체 권한
+- 직접 만든 MCP는 자체 인증 정책(예: read-only 토큰, IP 제한, 사용처별 분리)을 강제 가능
+- 단, 직접 만든 MCP는 직접 운영해야 함 → 운영 부담은 늘어남 (이 부분 자체가 "기획 관점" 트레이드오프)
+
+### 8-6. 도구 시그니처 변경에 취약
+
+- mcp-atlassian 업데이트 시 인자명/응답 구조가 바뀔 수 있음 → 통합 코드가 깨짐
+- `test_mcp_schema.py`로 회귀 검출은 가능하나, 발견 후 수정은 우리 몫
+- 직접 만든 MCP는 도구 시그니처를 우리가 통제
+
+---
+
+## 다른 브랜치
+
+- `main` — 시뮬레이션 본체 + 기존 README
+- `feature/mcp-confluence-custom` — 직접 만든 MCP 서버로 같은 use case 구현 (작업 예정)
+
+두 feature 브랜치의 비교 분석은 별도 문서 또는 main 브랜치 README의 비교 섹션에서 진행 예정.
