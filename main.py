@@ -38,30 +38,18 @@ REFLECTION_INTERVAL = 90                # 성찰 주기 (일) — 분기마다
 MODEL_DECISION     = "gpt-4.1-mini"     # 배치 결정 + 히스토리 압축용 (저렴/빠름)
 MODEL_REFLECTION   = "gpt-4.1"          # Reflection 전용 (고품질)
 
-# ── Confluence 연동 ────────────────────────────────────
-# .env에 CONFLUENCE_URL/USERNAME/API_TOKEN이 설정되어 있어야 함.
-#
-# code-driven (옵션 B): 코드가 호출 시점/내용을 결정. LLM은 Confluence를 모름.
-# - Reflection 직전: 과거 기록 fetch → 프롬프트 주입
-# - Reflection 직후: 결과를 Confluence 페이지로 저장
-USE_CONFLUENCE     = True
-PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Reflection 최대 개수
-#
-# LLM-driven (옵션 A): LLM이 도구 자율 호출. 시뮬레이션 시작 시 성향별 프로필 1회.
-# - 코드는 도구 셋(create_page만)·부모/제목 prefix만 강제, 본문은 LLM이 자유 작성
-USE_LLM_PROFILE    = True
-#
-# 저장 정책 — code-driven / LLM-driven 양쪽에 동시 적용:
-#   "append"    : 매 실행마다 run_id suffix 붙여 새 페이지 누적
-#   "overwrite" : 같은 (agent, day) 조합은 같은 제목 → 있으면 update, 없으면 create
-CONFLUENCE_WRITE_MODE = "overwrite"
-
 # ── 비교할 성향 목록 ────────────────────────────────────
 # 사용 가능한 성향: "균형형", "성과형", "사교형", "정치형", "워라밸형"
 ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워라밸형"]
 
 # ── Reflection on/off 비교 실험 설정 ────────────────────
 AB_COMPARE = ["정치형"]
+
+# ── Confluence 연동 (외부 mcp-atlassian 서버 사용) ──────────
+CONFLUENCE_WRITE_MODE = "overwrite"     # 페이지 저장 방식 : append / overwrite
+USE_LLM_PROFILE    = True               # LLM-driven on/off : 시뮬레이션 시작 시 성향별 프로필 페이지 생성
+USE_CONFLUENCE     = True               # code-driven on/off : Reflection 직전/직후에 로그 페이지 생성
+PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Reflection 최대 개수
 
 
 # ── Reflection 프롬프트 (기존과 동일) ──────────────────

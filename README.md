@@ -97,6 +97,15 @@ pip install langchain-mcp-adapters mcp-atlassian python-dotenv deepagents
 | `deepagents` | LangChain 위 Agent 추상화 (LLM-driven에서만 사용) |
 | `python-dotenv` | `.env` 로딩 |
 
+> **`langchain-mcp-adapters`가 왜 필요한가**
+> 본 프로젝트가 LangChain 기반(deepagents) 이기 때문.
+> MCP 자체 요구사항은 아니다 — OpenAI SDK나 직접 구현이라면 불필요.
+> 하는 일 2가지:
+> - **생성**: MCP 서버에 `tools/list` 요청 → 각 도구를 LangChain `BaseTool` 인스턴스로 래핑 (JSON Schema → Pydantic 변환 포함)
+> - **호출**: LangChain의 `tool.ainvoke({...})` → MCP `tools/call` 메시지로 직렬화해 서버에 전송 → 응답 파싱
+>
+> 서버를 직접 만들든 외부껄 쓰든 MCP 프로토콜은 동일하므로 **어댑터는 같은 것 하나로 양쪽에 동작**.
+
 ### 2-2. 환경변수 (`.env`)
 
 ```dotenv
@@ -349,11 +358,36 @@ def save_reflection(agent_name, day, text, quota, run_id=None, mode="append") ->
     return True
 ```
 
-**mode별 도구 호출 횟수**:
-- `append` — 1회 (`create_page`)
-- `overwrite` — 최대 2회 (`get_page` → 있으면 `update_page`, 없으면 `create_page`)
-
 `confluence_update_page`에 **version 인자가 없다**는 점이 mcp-atlassian의 편의 — 서버가 알아서 `+1` 처리해준다 (직접 MCP 서버를 만들었다면 우리가 처리해야 했음).
+
+##### `CONFLUENCE_WRITE_MODE`가 바꾸는 것들 (한눈에)
+
+`main.py`의 한 줄(`CONFLUENCE_WRITE_MODE = "append" | "overwrite"`)이 아래 항목을 연쇄로 바꾼다.
+
+| 항목 | `append` | `overwrite` |
+|---|---|---|
+| **페이지 제목** | `_<run_id>` suffix 붙음 → 매 실행마다 고유 | suffix 없음 → 실행 간 동일 |
+| **호출하는 MCP 도구** | `confluence_create_page` 1개 | `confluence_get_page` + (`confluence_update_page` 또는 `confluence_create_page`) |
+| **MCP 호출 횟수 (저장 1건당)** | 1회 | 2회 |
+| **Confluence 페이지 version** | 항상 `v1` (매번 새 페이지) | 실행마다 +1 증가 (같은 페이지를 덮어씀) |
+| **LLM Profile에 노출되는 도구** (→ 5-2장) | `confluence_create_page` 1개 | 코드가 사전 검색 → `confluence_update_page` 또는 `confluence_create_page` 중 1개만 |
+| **LLM 시스템 프롬프트 내용** (→ 5-2장) | "confluence_create_page 호출" 고정 | 검색 결과에 따라 "update" 또는 "create"로 바뀜 (`existing_id` 포함) |
+| **페이지 누적 수** | 실행할수록 무한 증가 | 상한선(에이전트×성향×일 수) |
+| **과거 실행 이력 보존** | 모든 실행본이 별도 페이지로 보존 | 직전 실행본만 남음 (이전 버전은 Confluence 이력 탭) |
+
+###### 핵심 연쇄
+
+```
+제목 규약 (suffix 유/무)
+   ↓
+도구 호출 시퀀스 (1회 vs 2회, create vs update)
+   ↓
+LLM 프롬프트 (어떤 도구를, 어떤 인자로 부르라고 할지)
+   ↓
+Confluence 최종 상태 (v1 신규 페이지 vs vN 덮어쓴 페이지)
+```
+
+즉 **플래그 1줄이 제목 규약을 결정 → 제목 규약이 "이미 있는지" 판단 기준을 만들고 → 그 판단이 도구 선택·호출 횟수를 결정 → 결과물 형태까지 결정**하는 구조. 페이지 제목만 바뀌는 게 아니라 **저장 정책 전체**가 바뀐다.
 
 ##### 조회 함수 (요지)
 
