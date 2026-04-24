@@ -78,6 +78,15 @@ pip install fastmcp httpx langchain-mcp-adapters python-dotenv deepagents
 | `deepagents` | LangChain 위 Agent 추상화 (LLM-driven에서만 사용) |
 | `python-dotenv` | `.env` 로딩 |
 
+> **`langchain-mcp-adapters`가 왜 필요한가**
+> 본 프로젝트가 LangChain 기반(deepagents) 이기 때문.
+> MCP 자체 요구사항은 아니다 — OpenAI SDK나 직접 구현이라면 불필요.
+> 하는 일 2가지:
+> - **생성**: MCP 서버에 `tools/list` 요청 → 각 도구를 LangChain `BaseTool` 인스턴스로 래핑 (JSON Schema → Pydantic 변환 포함)
+> - **호출**: LangChain의 `tool.ainvoke({...})` → MCP `tools/call` 메시지로 직렬화해 서버에 전송 → 응답 파싱
+>
+> 서버를 직접 만들든 외부껄 쓰든 MCP 프로토콜은 동일하므로 **어댑터는 같은 것 하나로 양쪽에 동작**.
+
 ### 2-2. 환경변수 (`.env`)
 
 ```dotenv
@@ -251,6 +260,42 @@ def _upsert(space_key, title, html_body, parent_id, mode):
 
 - `append`: 무조건 create (제목에 `_<run_id>` 들어가므로 충돌 없음)
 - `overwrite`: find → 있으면 update(version+1), 없으면 create
+
+##### `CONFLUENCE_WRITE_MODE`가 바꾸는 것들 (한눈에)
+
+`main.py`의 한 줄(`CONFLUENCE_WRITE_MODE = "append" | "overwrite"`)이 아래 항목을 연쇄로 바꾼다. **단, 모든 분기는 서버 내부(`_upsert`)에서 처리**되므로 클라이언트 인터페이스는 동일하다.
+
+| 항목 | `append` | `overwrite` |
+|---|---|---|
+| **페이지 제목** | `_<run_id>` suffix 붙음 → 매 실행마다 고유 | suffix 없음 → 실행 간 동일 |
+| **클라이언트가 호출하는 MCP 도구** | `save_reflection` 1개 | `save_reflection` 1개 (동일) |
+| **MCP 호출 횟수 (저장 1건당)** | 1회 | 1회 (동일) |
+| **서버 내부 REST 호출** | `create_page` 1회 | `find_page_by_title` → (`update_page` 또는 `create_page`) 2회 |
+| **Confluence 페이지 version** | 항상 `v1` (매번 새 페이지) | 실행마다 +1 증가 (같은 페이지를 덮어씀) |
+| **LLM Profile에 노출되는 도구** (→ 5-2장) | `save_personality_profile` 1개 | `save_personality_profile` 1개 (동일) |
+| **LLM 시스템 프롬프트 내용** (→ 5-2장) | `mode="append"` 전달 지시 1줄 추가 | `mode="overwrite"` 전달 지시 1줄 추가 (그 외 동일) |
+| **페이지 누적 수** | 실행할수록 무한 증가 | 상한선(성향×일 수) |
+| **과거 실행 이력 보존** | 모든 실행본이 별도 페이지로 보존 | 직전 실행본만 남음 (이전 버전은 Confluence 이력 탭) |
+
+###### 핵심 연쇄
+
+```
+main.py CONFLUENCE_WRITE_MODE ──►  wrapper mode 인자  ──►  MCP tool.ainvoke(mode=...)
+                                                              │
+                                                              ▼
+                                                     서버의 save_reflection()
+                                                              │
+                                                     _build_reflection_title(mode)
+                                                              │
+                                                              ▼
+                                                         _upsert(mode)
+                                                     │                  │
+                                                 append              overwrite
+                                                     │                  │
+                                                 create_page       find → update/create
+```
+
+즉 **플래그 1줄은 "mode 문자열"로서 서버까지 그대로 흘러간다**. 제목 규약·도구 선택·REST 호출 수는 전부 **서버 내부 책임**이라 클라이언트 코드·도구 목록·프롬프트 구조는 mode 전환 시 **변경되지 않는다**. (공식 브랜치는 정책이 클라이언트 코드 구조까지 바꾼다 — `다른 브랜치` 섹션 비교 참조.)
 
 #### 〔D〕 Atlassian REST 호출 (`confluence_client.py`)
 
@@ -488,18 +533,19 @@ def create_personality_profile(personality, agent_name, run_id, model,
 
 ---
 
-## 다른 브랜치
-
-- `main` — 시뮬레이션 본체 + 기존 README
-- `feature/mcp-confluence-official` — 외부(커뮤니티) MCP 서버(`mcp-atlassian`)로 같은 use case 구현
-
-두 feature 브랜치 비교:
+## 비교
 
 | | 공식 브랜치 (외부 MCP) | 커스텀 브랜치 (직접 만든 MCP) |
 |---|---|---|
 | 서버 작성 부담 | 0 (설치만) | 본 프로젝트가 작성·유지 |
 | 노출 도구 | 24개 일반 CRUD | 3개 도메인 도구 |
-| 클라이언트 코드량 | 많음 (도메인 변환 책임) | 적음 (서버가 도메인 통제) |
+| 서버 측 코드 | 0 (외부 패키지) | 본 프로젝트가 작성·유지 (~303줄) |
+| 클라이언트 측 코드 | 많음 — 도메인 변환을 호출 측이 떠안음 (~261줄) | 적음 — 도메인 인자만 넘김 (~148줄) |
 | 도구 시그니처 변경 위험 | mcp-atlassian 업데이트에 종속 | 본 프로젝트 통제 |
 | 사용 가능 도구 범위 | 24개 다 즉시 활용 가능 | 우리가 정의한 것만 (필요 시 추가) |
 | 인증·운영 | 외부 패키지에 위임 | 본 프로젝트 책임 |
+
+> **"클라이언트 측 코드"** = MCP 서버를 호출하는 쪽. 본 프로젝트에선 wrapper([confluence_mcp/confluence_custom.py](confluence_mcp/confluence_custom.py))와 [main.py](main.py)의 호출 지점.
+> Confluence는 일반 페이지 저장소의 언어(`title`, `body`, `parent_id`)로 말하고, 본 프로젝트는 도메인의 언어(`agent_name`, `day`)로 말함.
+> 외부 MCP는 이 둘 사이의 **번역을 호출 시마다** 호출 측이 함 → 코드 길어짐.
+> 직접 만든 MCP는 그 번역을 **서버가 한 번 정의**해두므로 호출 측은 도메인 인자만 넘기면 됨.
