@@ -50,6 +50,11 @@ PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Refle
 # LLM-driven (옵션 A): LLM이 도구 자율 호출. 시뮬레이션 시작 시 성향별 프로필 1회.
 # - 코드는 도구 셋(create_page만)·부모/제목 prefix만 강제, 본문은 LLM이 자유 작성
 USE_LLM_PROFILE    = True
+#
+# 저장 정책 — code-driven / LLM-driven 양쪽에 동시 적용:
+#   "append"    : 매 실행마다 run_id suffix 붙여 새 페이지 누적
+#   "overwrite" : 같은 (agent, day) 조합은 같은 제목 → 있으면 update, 없으면 create
+CONFLUENCE_WRITE_MODE = "overwrite"
 
 # ── 비교할 성향 목록 ────────────────────────────────────
 # 사용 가능한 성향: "균형형", "성과형", "사교형", "정치형", "워라밸형"
@@ -451,6 +456,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
             agent_name=agent_name,
             run_id=timestamp,
             model=MODEL_REFLECTION,
+            mode=CONFLUENCE_WRITE_MODE,
         )
         txt_file.write(f"  [성향 프로필 LLM 등록] {'성공' if profile_ok else '실패'}\n")
         txt_file.flush()
@@ -549,6 +555,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                                 text=reflection_text,
                                 quota=action_quota,
                                 run_id=timestamp,
+                                mode=CONFLUENCE_WRITE_MODE,
                             )
                             txt_file.write(f"  [Confluence 저장] {'성공' if saved else '실패'}\n")
                             txt_file.flush()

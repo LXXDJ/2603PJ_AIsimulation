@@ -9,6 +9,7 @@
 3. [서비스 흐름과 MCP 추가 지점](#3-서비스-흐름과-mcp-추가-지점)
 4. [연결에 필요한 코드](#4-연결에-필요한-코드)
 5. [부가: code-driven vs LLM-driven 비교](#5-부가-code-driven-vs-llm-driven-비교)
+6. [저장 정책 변경 비용: 외부 MCP vs 직접 만든 MCP](#6-저장-정책-변경-비용-외부-mcp-vs-직접-만든-mcp)
 
 ---
 
@@ -292,16 +293,20 @@ PARENT_PAGE_ID = "120520708"   # 모든 결과 페이지를 이 페이지의 자
 SPACE_KEY = "mcptest"
 ```
 
-##### 사용할 도구 선택 (24개 중 2개만)
+##### 사용할 도구 선택 (24개 중 4개)
 
-`mcp-atlassian`이 노출하는 24개 Confluence 도구 중 우리 use case에 필요한 2개만 사용:
+`mcp-atlassian`이 노출하는 24개 Confluence 도구 중 우리 use case에 필요한 4개:
 
 | 도구 | wrapper 함수 | 우리 도메인 매핑 |
 |---|---|---|
-| `confluence_create_page` | `save_reflection()` | Reflection 결과를 자식 페이지로 저장 |
+| `confluence_create_page` | `save_reflection()` (append) | Reflection 결과를 자식 페이지로 저장 |
 | `confluence_get_page_children` | `fetch_past_reflections_text()` | 부모 페이지의 자식들을 가져와 prefix 필터링 |
+| `confluence_get_page` | `find_page_id_by_title()` | overwrite 모드에서 같은 제목 페이지가 있는지 확인 |
+| `confluence_update_page` | `save_reflection()` (overwrite 분기) | 있으면 본문 덮어쓰기 (버전은 mcp-atlassian이 자동 +1) |
 
 > `confluence_search`는 CQL 인덱싱 지연으로 직후 조회 시 빈 결과를 반환하는 케이스가 있어 `get_page_children`을 선택했다 (디버깅 중 실측). 같은 부모 아래 매다는 구조에서는 자식 조회가 즉시 일관성 보장.
+
+> `CONFLUENCE_WRITE_MODE="overwrite"` 정책 때문에 2개 도구가 추가됐음. **append 모드만 썼을 때는 create 1개로 끝**이었다는 점이 핵심 — 정책 변경이 도구 호출 목록을 바꾼다는 것 자체가 외부 MCP의 특징이다 (6장 참조).
 
 ##### 페이지 제목 규약 (우리 도메인)
 
@@ -314,36 +319,41 @@ Reflection_{agent_name}_Day{day:04d}[_{run_id}]
 - `run_id`(시뮬레이션 시작 timestamp) suffix → 같은 에이전트로 여러 번 돌려도 제목 충돌 없음
 - 조회 시 `Reflection_{agent_name}_Day` prefix만 매칭 → 클라이언트에서 필터링/정렬
 
-##### 저장 함수
+##### 저장 함수 (mode 지원)
 
 ```python
-def save_reflection(agent_name, day, text, quota, run_id=None) -> bool:
+def save_reflection(agent_name, day, text, quota, run_id=None, mode="append") -> bool:
     tools = _ensure_init()
-    create = tools["confluence_create_page"]
+    title = _build_reflection_title(agent_name, day, run_id, mode)   # append→suffix, overwrite→고정
+    body  = build_body(agent_name, day, text, quota)
 
-    suffix = f"_{run_id}" if run_id else ""
-    title = f"Reflection_{agent_name}_Day{day:04d}{suffix}"
-    body = (
-        f"**Agent**: {agent_name}\n\n"
-        f"**Day**: {day}\n\n"
-        f"**Quota**: `{json.dumps(quota, ensure_ascii=False)}`\n\n"
-        f"---\n\n{text}\n"
-    )
-    try:
-        _local.loop.run_until_complete(create.ainvoke({
-            "space_key": SPACE_KEY,
-            "title": title,
-            "content": body,
-            "parent_id": PARENT_PAGE_ID,
-            "content_format": "markdown",
-        }))
-        return True
-    except Exception as e:
-        print(f"[Confluence] save 실패: {e}")
-        return False
+    # overwrite 모드: 같은 제목 페이지 검색 → 있으면 update, 없으면 create로 fallthrough
+    if mode == "overwrite":
+        existing_id = find_page_id_by_title(title, tools)   # confluence_get_page 호출
+        if existing_id:
+            update = tools["confluence_update_page"]
+            _local.loop.run_until_complete(update.ainvoke({
+                "page_id": existing_id,
+                "title": title,
+                "content": body,
+                "content_format": "markdown",
+            }))
+            return True
+
+    # append, 또는 overwrite인데 없음 → create
+    create = tools["confluence_create_page"]
+    _local.loop.run_until_complete(create.ainvoke({
+        "space_key": SPACE_KEY, "title": title, "content": body,
+        "parent_id": PARENT_PAGE_ID, "content_format": "markdown",
+    }))
+    return True
 ```
 
-위 〔A〕〔B〕의 일반 패턴을 우리 도메인 규약(제목/본문 형식, 저장 위치)에 맞춰 채운 형태.
+**mode별 도구 호출 횟수**:
+- `append` — 1회 (`create_page`)
+- `overwrite` — 최대 2회 (`get_page` → 있으면 `update_page`, 없으면 `create_page`)
+
+`confluence_update_page`에 **version 인자가 없다**는 점이 mcp-atlassian의 편의 — 서버가 알아서 `+1` 처리해준다 (직접 MCP 서버를 만들었다면 우리가 처리해야 했음).
 
 ##### 조회 함수 (요지)
 
@@ -390,7 +400,15 @@ def fetch_past_reflections_text(agent_name, limit=3) -> str:
 from confluence_mcp import confluence_official
 ```
 
-**(2) `_run_one()` 안의 Reflection 블록 전후** — 기존 코드에 끼워넣음:
+**(2) 상단 플래그** — on/off + 저장 정책:
+
+```python
+USE_CONFLUENCE        = True         # confluence 연결 on/off
+USE_LLM_PROFILE       = True         # LLM-driven 프로필 on/off
+CONFLUENCE_WRITE_MODE = "overwrite"  # "append" | "overwrite" — 코드/LLM 양쪽 동시 적용
+```
+
+**(3) `_run_one()` 안의 Reflection 블록 전후** — 기존 코드에 끼워넣음:
 
 ```python
 # Reflection 직전: 과거 기록 fetch → 프롬프트 주입
@@ -409,10 +427,9 @@ if USE_CONFLUENCE:
         agent_name=agent_name, day=day,
         text=reflection_text, quota=action_quota,
         run_id=timestamp,
+        mode=CONFLUENCE_WRITE_MODE,   # ← 한 줄로 정책 통제
     )
 ```
-
-main.py 상단에서  `USE_CONFLUENCE = True/False` 한 줄로 confluence 연결 on/off 가능.
 
 ---
 
@@ -435,30 +452,50 @@ confluence_official.save_reflection(agent_name, day, text, quota, run_id)
 
 ### 5-2. LLM 연결 (LLM-driven)
 
-`confluence_mcp/llm_personality.py`에서 **MCP 도구를 Deep Agent에 넘기고 호출은 LLM에 위임**
+`confluence_mcp/llm_personality.py`에서 **MCP 도구를 Deep Agent에 넘기고 호출은 LLM에 위임**. mode 분기는 코드가 책임지고(외부 MCP는 도메인 도구가 없어서), LLM에는 **선택된 도구 1개만** 노출.
 
 ```python
-def create_personality_profile(personality, agent_name, run_id, model) -> bool:
+PROFILE_TIMEOUT_SEC = 90   # OpenAI Responses API stall 방어
+
+def create_personality_profile(personality, agent_name, run_id, model, mode="append") -> bool:
     tools = _ensure_init()
-    create_page = tools["confluence_create_page"]   # ← LLM에 노출할 도구
+    title = f"Profile_{agent_name}_{run_id}" if mode == "append" else f"Profile_{agent_name}"
+
+    # overwrite 모드면 코드가 먼저 검색 → 결과에 따라 update 도구만 / create 도구만 노출
+    existing_id = find_page_id_by_title(title, tools) if mode == "overwrite" else None
+
+    if existing_id:
+        exposed_tool = tools["confluence_update_page"]
+        tool_instruction = (f'confluence_update_page를 1번 호출. '
+                            f'page_id="{existing_id}", title="{title}", content_format="markdown".')
+    else:
+        exposed_tool = tools["confluence_create_page"]
+        tool_instruction = (f'confluence_create_page를 1번 호출. '
+                            f'space_key="{SPACE_KEY}", parent_id="{PARENT_PAGE_ID}", '
+                            f'title="{title}", content_format="markdown".')
 
     profile_agent = create_deep_agent(
         model=f"openai:{model}",
-        tools=[create_page],                         # ← 도구를 LLM에 넘김
+        tools=[exposed_tool],                         # ← LLM은 모드 분기를 모름
         system_prompt=f"""당신은 {personality.name} 성향의 에이전트입니다.
-            confluence_create_page를 1번 호출해서 자신의 프로필 페이지를 작성하세요.
-            제목: "Profile_{agent_name}_{run_id}", parent_id: "{PARENT_PAGE_ID}",
-            content_format: "markdown", 본문은 자유 작성.""",
+            {tool_instruction}
+            본문은 마크다운으로 자유 작성.""",
     )
 
-    # langchain-mcp-adapters가 async-only → ainvoke로 thread-local loop 위에서 실행
-    _local.loop.run_until_complete(profile_agent.ainvoke({
-        "messages": [{"role": "user", "content": "프로필 페이지를 작성하세요."}]
-    }))
+    # langchain-mcp-adapters가 async-only → ainvoke + 90초 timeout (응답 stall 방어)
+    _local.loop.run_until_complete(asyncio.wait_for(
+        profile_agent.ainvoke({
+            "messages": [{"role": "user", "content": "프로필 페이지를 작성하세요."}]
+        }),
+        timeout=PROFILE_TIMEOUT_SEC,
+    ))
     return True
 ```
 
-코드는 **도구 셋과 호출 규약(시스템 프롬프트)만 강제**, 실제 호출 시점·인자값·본문 작성은 LLM이 알아서.
+두 가지 주의할 점:
+
+1. **mode 분기를 코드가 가져간 이유** — LLM에게 "update 도구와 create 도구를 다 주고, overwrite 모드면 먼저 get_page로 찾고 있으면 update, 없으면 create" 같은 절차를 지시할 수도 있지만, 실수 위험이 커진다. 외부 MCP는 도메인 도구가 없어서 **정책 분기를 어디든 누가 책임져야** 하고, 코드가 가져가면 LLM은 1개 도구만 보므로 실수 표면이 줄어든다.
+2. **`asyncio.wait_for(timeout=90)`** — deepagents는 `"openai:"` prefix 시 Responses API를 사용하는데, SSE 스트림이 stall되면 openai SDK 디폴트(read 600s × retry 2회)로 최대 30분 무응답. 90초에 포기하고 본체 시뮬만 계속.
 
 ### 5-3. 비교표
 
@@ -471,7 +508,7 @@ def create_personality_profile(personality, agent_name, run_id, model) -> bool:
 | 결과 일관성 | 매번 동일한 형식 | 매번 다른 형식 (맥락 적응) |
 | 토큰 비용 | 0 (LLM 호출 안 함) | 시스템 프롬프트 + 도구 스키마 + 응답 |
 | 디버깅 | 코드만 보면 됨 | LLM 응답 + tool call trace 함께 |
-| 실패 모드 | 네트워크/인증 에러만 | + LLM이 도구 안 부르거나 잘못 부를 수 있음 |
+| 실패 모드 | 네트워크/인증 에러만 | + LLM이 도구 안 부르거나 잘못 부를 수 있음<br/>+ 멀티 에이전트 호출 시 응답 stall 가능 → 클라이언트 timeout 필요 |
 | 새 작업 추가 | 코드 수정 필요 | 시스템 프롬프트 수정으로도 가능 |
 
 ### 5-4. 어떤 경우에 어떤 방식이 적합한가
@@ -487,4 +524,43 @@ def create_personality_profile(personality, agent_name, run_id, model) -> bool:
 - 본문이 맥락에 따라 달라야 함 (예: 사용자가 읽을 자유 텍스트)
 - 입력을 해석한 뒤 동적으로 행동 (예: 사용자 채팅에 반응)
 - 코드로 if/else 작성하기 너무 많은 케이스
+
+---
+
+## 6. 저장 정책 변경 비용: 외부 MCP vs 직접 만든 MCP
+
+이 브랜치와 직접 만든 MCP 서버 브랜치([`feature/mcp-confluence-custom`](https://github.com/LXXDJ/2603PJ_AIsimulation/tree/feature/mcp-confluence-custom))는 같은 use case(Reflection 저장/조회) + 같은 `CONFLUENCE_WRITE_MODE="overwrite"` 정책을 구현한다. **정책을 추가했을 때 코드가 어디가 얼마나 바뀌는가**가 두 브랜치의 본질적 차이를 가장 잘 드러낸다.
+
+### 6-1. 같은 정책, 다른 위치
+
+`mode="overwrite"`(같은 제목이면 덮어쓰기) 정책을 추가하려면 "같은 제목 페이지를 찾고, 있으면 update, 없으면 create"라는 분기가 필요하다. 이 분기를 **어디에 둘 수 있는가**가 다르다.
+
+| | 이 브랜치 (외부 MCP) | 직접 만든 MCP |
+|---|---|---|
+| 분기 위치 | **클라이언트 wrapper** (찾아야 할 도구가 분리됨) | **서버 내부 `_upsert()` 헬퍼** |
+| 이유 | mcp-atlassian이 일반 CRUD만 노출 → 도메인 도구 없음 → 조합 책임을 클라이언트가 짐 | 우리 서버에 `save_reflection(mode=...)` 도메인 도구 있음 → 서버가 분기 |
+| 클라이언트가 호출하는 MCP 도구 | mode에 따라 **1~2개** (`get_page` → `update_page` 또는 `create_page`) | 항상 1개 (`save_reflection`) |
+
+### 6-2. 코드 연결(code-driven) 변경 비교
+
+- **이 브랜치**: `save_reflection()` wrapper에 `if mode == "overwrite": get_page → existing_id 있으면 update_page, 없으면 create_page`. 호출 측 분기와 도구 2~3개 조합 필요.
+- **직접 만든 MCP**: `save_reflection(mode="overwrite")` 호출 한 줄. 분기는 서버의 `_upsert`가 처리.
+
+**결과**: 이 브랜치는 클라이언트 wrapper 코드량이 늘어남 + MCP 호출 횟수 늘어남(overwrite 모드 1건 저장당 최대 2회). 직접 만든 MCP는 클라이언트 변경 0, 호출 횟수 1.
+
+### 6-3. LLM 연결(LLM-driven) 변경 비교
+
+이쪽이 차이가 더 크다.
+
+- **이 브랜치**: LLM에게 도구 2개(create/update)를 주고 "overwrite면 먼저 찾아보고..."라고 지시할 수도 있지만 **LLM 실수 위험**이 커진다. 안전한 설계는 **코드가 먼저 `find_page_id_by_title()`로 검색 → 결과에 따라 update 또는 create 도구만 LLM에 노출**하는 것. 즉 외부 MCP에서는 **LLM-driven이라도 코드가 정책 분기를 책임**지게 된다.
+- **직접 만든 MCP**: LLM에게 도메인 도구 `save_personality_profile`만 노출하고 mode 인자를 프롬프트에 박으면 끝. 분기는 서버 내부에서 처리되므로 LLM은 모드 존재 자체를 몰라도 됨.
+
+**결과**: 이 브랜치는 LLM 연결이라 해도 "LLM의 자율성"이 현실적으로 제한됨 (분기를 코드가 가져가야 안전). 직접 만든 MCP는 LLM이 실제로 도메인 인자만 채우고 서버가 나머지를 처리하는, 이상적 형태에 가까움.
+
+### 6-4. 한 줄 요약
+
+> 외부 MCP는 정책을 "도구 호출 시퀀스"로 번역해 클라이언트가 실행한다.
+> 직접 만든 MCP는 정책을 "서버 함수 인자 1개"로 표현한다.
+>
+> 정책이 몇 개 안 되고 안정적일 때는 외부 MCP의 비용이 작다. 정책이 늘어나거나 자주 바뀌면 직접 만든 MCP의 "서버가 도메인을 안다"는 장점이 복리로 커진다.
 
