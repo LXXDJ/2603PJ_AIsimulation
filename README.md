@@ -547,5 +547,6 @@ def create_personality_profile(personality, agent_name, run_id, model,
 
 > **"클라이언트 측 코드"** = MCP 서버를 호출하는 쪽. 본 프로젝트에선 wrapper([confluence_mcp/confluence_custom.py](confluence_mcp/confluence_custom.py))와 [main.py](main.py)의 호출 지점.
 > Confluence는 일반 페이지 저장소의 언어(`title`, `body`, `parent_id`)로 말하고, 본 프로젝트는 도메인의 언어(`agent_name`, `day`)로 말함.
-> 외부 MCP는 이 둘 사이의 **번역을 호출 시마다** 호출 측이 함 → 코드 길어짐.
-> 직접 만든 MCP는 그 번역을 **서버가 한 번 정의**해두므로 호출 측은 도메인 인자만 넘기면 됨.
+> 외부 MCP는 이 번역을 **클라이언트 코드에서** 처리 (helper 모듈로 응집해도 결국 클라이언트 측).
+> 직접 만든 MCP는 번역을 **서버가 함** → 호출 측은 도메인 인자만 넘김.
+> 특히 **LLM 호출자에게는 이 차이가 결정적** — LLM은 helper를 못 보고 MCP 도구만 보기 때문.
