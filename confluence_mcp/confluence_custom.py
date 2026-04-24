@@ -80,8 +80,10 @@ def _unwrap_response(raw):
 
 
 def save_reflection(agent_name: str, day: int, text: str,
-                    quota: dict | None, run_id: str | None = None) -> bool:
-    """Reflection을 우리 MCP 서버를 통해 Confluence에 저장. 성공 여부 반환."""
+                    quota: dict | None, run_id: str | None = None,
+                    mode: str = "append") -> bool:
+    """Reflection을 우리 MCP 서버를 통해 Confluence에 저장. 성공 여부 반환.
+    mode: 'append'(기본, 실행별로 새 페이지) 또는 'overwrite'(같은 agent·day는 덮어씀)."""
     try:
         tools = _ensure_init()
     except Exception as e:
@@ -100,6 +102,7 @@ def save_reflection(agent_name: str, day: int, text: str,
             "text": text,
             "quota": quota,
             "run_id": run_id,
+            "mode": mode,
         }))
         return True
     except Exception as e:

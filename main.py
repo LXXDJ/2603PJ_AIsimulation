@@ -46,10 +46,11 @@ ACTIVE_PERSONALITIES = ["균형형", "성과형", "사교형", "정치형", "워
 AB_COMPARE = ["정치형"]
 
 # ── Confluence 연동 (직접 만든 MCP 서버 사용) ──────────
-# code-driven: Reflection 직전/직후에 코드가 도구 호출. LLM은 Confluence를 모름.
-# 서버(confluence_mcp_server/)가 도메인 도구 2개를 노출하고, 클라이언트(confluence_mcp/)가 호출.
-USE_CONFLUENCE     = True
+CONFLUENCE_WRITE_MODE = "overwrite"     # 페이지 저장 방식 : append / overwrite
+USE_LLM_PROFILE    = True               # LLM-driven on/off : 시뮬레이션 시작 시 성향별 프로필 페이지 생성
+USE_CONFLUENCE     = True               # code-driven on/off : Reflection 직전/직후에 로그 페이지 생성
 PAST_REFLECT_LIMIT = 3                  # 프롬프트에 주입할 과거 Reflection 최대 개수
+
 
 
 # ── Reflection 프롬프트 (기존과 동일) ──────────────────
@@ -436,6 +437,23 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
     txt_file.write(f"{'='*60}\n에이전트: {agent_name}  (시작: {datetime.now().isoformat()})\n{'='*60}\n")
     txt_file.flush()
 
+    # LLM-driven 데모: 시뮬레이션 시작 시점에 성향별 프로필 페이지를 LLM이 자율 작성
+    if USE_LLM_PROFILE:
+        from confluence_mcp.llm_personality import create_personality_profile
+        profile_ok = create_personality_profile(
+            personality=personality,
+            agent_name=agent_name,
+            run_id=timestamp,
+            model=MODEL_REFLECTION,
+            mode=CONFLUENCE_WRITE_MODE,
+        )
+        txt_file.write(f"  [성향 프로필 LLM 등록] {'성공' if profile_ok else '실패'}\n")
+        txt_file.flush()
+        log_file.write(json.dumps({
+            "type": "llm_profile", "agent": agent_name, "ok": profile_ok,
+        }, ensure_ascii=False) + "\n")
+        log_file.flush()
+
     pbar = tqdm(
         total=MAX_DAYS, desc=f"{agent_name}", position=tqdm_position,
         leave=True, unit="일",
@@ -526,6 +544,7 @@ def _run_one(personality_name: str, tqdm_position: int = 0,
                                 text=reflection_text,
                                 quota=action_quota,
                                 run_id=timestamp,
+                                mode=CONFLUENCE_WRITE_MODE,
                             )
                             txt_file.write(f"  [Confluence 저장] {'성공' if saved else '실패'}\n")
                             txt_file.flush()

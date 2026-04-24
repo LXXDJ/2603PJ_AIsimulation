@@ -20,7 +20,8 @@ _REST_ROOT = f"{CONFLUENCE_BASE_URL}/rest/api"
 def _request(method: str, path: str,
              json_body: dict | None = None,
              params: dict | None = None) -> dict[str, Any]:
-    """Atlassian REST API 단일 호출. 인증·timeout·에러 raise 표준화."""
+    """Atlassian REST API 단일 호출. 인증·timeout·에러 raise 표준화.
+    204 No Content(주로 DELETE)일 경우 빈 dict 반환."""
     url = f"{_REST_ROOT}/{path.lstrip('/')}"
     response = httpx.request(
         method, url,
@@ -30,6 +31,8 @@ def _request(method: str, path: str,
         timeout=30.0,
     )
     response.raise_for_status()
+    if not response.content:
+        return {}
     return response.json()
 
 
@@ -68,3 +71,35 @@ def get_child_pages(parent_id: str, limit: int = 50, expand_body: bool = True) -
             "body_html": body_html,
         })
     return out
+
+
+def find_page_by_title(space_key: str, title: str) -> dict | None:
+    """제목 완전 일치로 페이지 1건 조회. 없으면 None.
+    overwrite 모드에서 "이미 같은 이름 페이지가 있나"를 판단할 때 쓴다."""
+    raw = _request("GET", "content", params={
+        "spaceKey": space_key,
+        "title": title,
+        "expand": "version",
+    })
+    results = raw.get("results", [])
+    if not results:
+        return None
+    hit = results[0]
+    return {
+        "id": hit.get("id", ""),
+        "title": hit.get("title", ""),
+        "version": hit.get("version", {}).get("number", 1),
+    }
+
+
+def update_page(page_id: str, title: str, html_body: str, current_version: int) -> dict:
+    """기존 페이지를 새 본문으로 덮어쓴다. Confluence는 version을 +1 해서 보내야 함.
+    응답에서 id·title만 골라 반환."""
+    body = {
+        "type": "page",
+        "title": title,
+        "version": {"number": current_version + 1},
+        "body": {"storage": {"value": html_body, "representation": "storage"}},
+    }
+    raw = _request("PUT", f"content/{page_id}", json_body=body)
+    return {"id": raw["id"], "title": raw["title"]}
