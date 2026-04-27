@@ -5,3 +5,4 @@ __pycache__/
 logs/
 .claude/
 debug_*.py
+COMPARISON_OLD.md
