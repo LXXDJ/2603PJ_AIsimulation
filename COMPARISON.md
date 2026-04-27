@@ -7,6 +7,10 @@
 3. [각 방식의 특징과 장단점](#3-각-방식의-특징과-장단점)
 4. [어떻게 선택할 것인가](#4-어떻게-선택할-것인가)
 5. [코드로 보는 차이](#5-코드로-보는-차이)
+6. [부록](#부록)
+    - [A. Confluence(`mcp-atlassian`) 사용 시 알아야 할 것](#a-confluencemcp-atlassian-사용-시-알아야-할-것)
+    - [B. 양쪽 다 빠지기 쉬운 운영 함정](#b-양쪽-다-빠지기-쉬운-운영-함정)
+    - [C. MCP 서버 프레임워크 선택지](#c-mcp-서버-프레임워크-선택지)
 
 # 1. MCP란 무엇인가
 
@@ -697,5 +701,216 @@ def update_page(page_id, title, html_body, current_version) -> dict:
 - **합계**: 직접 구현이 +157줄 더 많음 = 새로 짊어진 서버 본체 비용.
 - **클라이언트만 보면**: 직접 구현이 −146줄(약 38% 감소). 도메인 변환을 서버로 옮긴 결과.
 - LLM-driven 파일도 같은 방향: 외부 126줄 vs 직접 93줄(−33줄). 시스템 프롬프트가 짧아졌다 = LLM에 인프라 인자를 안 가르쳐도 된다는 뜻.
+
+# **부록**
+
+## **A. Confluence(`mcp-atlassian`) 사용 시 알아야 할 것**
+
+### **A.1 검색이 신뢰할 수 없음 (CQL 인덱싱 지연)**
+
+`confluence_search` 도구는 Confluence의 CQL(Confluence Query Language)을 사용. 그런데 페이지 생성 직후 바로 검색하면 **빈 결과가 나오는 경우가 있음** — Confluence의 검색 인덱스가 갱신되는 데 시간이 걸리기 때문.
+**우회 방법**: 부모-자식 관계를 만들고 `confluence_get_page_children`을 사용. 인덱싱과 무관하게 즉시 조회 가능.
+
+```python
+# ❌ 검색 — 직후 호출 시 빈 결과 가능
+results = confluence_search(cql=f'title="{title}" AND space="{SPACE_KEY}"')
+
+# ✅ 부모 페이지 자식 조회 — 즉시 신뢰 가능
+children = confluence_get_page_children(parent_id=PARENT_PAGE_ID)
+```
+
+### A.2 응답 형식이 도구마다 일관되지 않음
+
+24개 도구가 응답을 **plain string / JSON 문자열 / 리스트** 등 서로 다른 모양으로 반환. 도구마다 파싱 코드가 따로 필요함.
+
+**대응**: `_unwrap_text` 같은 정규화 함수를 wrapper에 만들어 응답을 일관된 형태로 변환. 본 가이드의 `confluence_official.py`에서 이 함수가 사실상 필수 보일러플레이트.
+
+### A.3 응답 안에 또 JSON 문자열이 들어 있음
+
+`confluence_get_page` 같은 도구는 `text` 필드 안에 JSON 문자열을 다시 넣어 반환. `json.loads`를 한 번 더 해야 실제 데이터가 나옴.
+
+```python
+result = await tools["confluence_get_page"].ainvoke({"page_id": "12345"})
+# result = [{"type": "text", "text": '{"id": "12345", "title": "...", ...}'}]
+#                                    ↑ 이 안에 또 JSON 문자열
+
+text = result[0]["text"]           # 1차 unwrap
+data = json.loads(text)            # 2차 파싱 필요
+```
+
+### A.4 `update_page`의 version 자동 처리 (장점 사례)
+
+Confluence는 동시 수정 충돌을 막기 위해 **낙관적 락**을 사용. 페이지 갱신 시 현재 version을 받아서 +1해 보내야 함. `mcp-atlassian`은 이걸 **내부에서 자동 처리** — 호출자는 신경 쓸 필요 없음.
+
+```python
+# 외부 MCP — version 자동 처리됨
+await tools["confluence_update_page"].ainvoke({
+    "page_id": "12345",
+    "title": "새 제목",
+    "content": "새 본문",
+    # version 인자 없음 — 패키지가 알아서
+})
+```
+
+### A.5 24개 도구 중 use case에 맞게 선택
+
+`mcp-atlassian`은 24개 도구를 모두 노출하지만, 실제로 우리 use case에 필요한 건 보통 4~6개. **사람이 직접 골라서 사용**해야 함.
+
+본 가이드 사례는 4개만 사용:
+
+- `confluence_create_page`
+- `confluence_update_page`
+- `confluence_get_page`
+- `confluence_get_page_children`
+
+```python
+# 도구 풀 받기
+tools = await client.get_tools()
+
+# 필요한 것만 dict로 추려 사용
+tools_to_use = {
+    "create": tools["confluence_create_page"],
+    "update": tools["confluence_update_page"],
+    "get": tools["confluence_get_page"],
+    "children": tools["confluence_get_page_children"],
+}
+```
+
+> **LLM에 24개를 모두 노출하면 잘못된 도구를 고를 위험이 큼.** 코드 호출자는 명시적으로 4개만 쓰면 되지만, LLM이 호출자라면 시스템 프롬프트에서 사용 가능한 도구를 명시적으로 제한하거나, 차라리 직접 구현으로 도메인 도구만 노출하는 게 안전.
+> 
+
+## B. 양쪽 다 빠지기 쉬운 운영 함정
+
+### B.1 어댑터는 async-only
+
+`langchain-mcp-adapters`는 **sync 호출을 지원하지 않음**. 모든 도구 호출은 `await`이 필요.
+
+**대응**: 워커 스레드마다 `asyncio.new_event_loop()`를 만들어 `loop.run_until_complete()`로 감싸 호출.
+
+```python
+# 동기 함수 안에서 비동기 도구 호출
+loop = asyncio.new_event_loop()
+result = loop.run_until_complete(tool.ainvoke({...}))
+```
+
+### B.2 stdio는 thread-safe 하지 않음
+
+MCP subprocess는 stdin/stdout이 1쌍 → **여러 스레드가 같은 subprocess를 공유하면 메시지가 인터리빙(섞임)** 됨.
+
+**대응**: `threading.local()`로 스레드별 격리. 각 스레드가 자기만의 subprocess + event loop를 가짐.
+
+```python
+_local = threading.local()
+
+def _ensure_init():
+    if not hasattr(_local, "tools"):
+        _local.loop = asyncio.new_event_loop()
+        _local.tools = _local.loop.run_until_complete(_init_client())
+    return _local.tools
+```
+
+### B.3 Subprocess 환경변수 누락
+
+`load_dotenv()`로 환경변수를 로드해도 **spawn된 subprocess에는 자동으로 들어가지 않음**. 명시적으로 `env=` 인자로 전달해야 함.
+
+```python
+def _build_subprocess_env():
+    return {
+        "PATH": os.environ["PATH"],            # ← 빼먹기 쉬움. Windows에서 실행파일 검색 실패
+        "CONFLUENCE_URL": os.environ["CONFLUENCE_URL"],
+        "CONFLUENCE_USERNAME": os.environ["CONFLUENCE_USERNAME"],
+        "CONFLUENCE_API_TOKEN": os.environ["CONFLUENCE_API_TOKEN"],
+    }
+```
+
+> **`PATH`를 빼먹는 게 흔한 실수.** Windows에서 `mcp-atlassian` 실행파일을 못 찾음.
+> 
+
+### B.4 응답 형식 가정 금지
+
+같은 MCP 서버 안에서도 도구마다 응답 모양이 다를 수 있음(외부 MCP는 더 심함). 단순히 `result["text"]` 같은 가정은 위험.
+
+**대응**: `_unwrap_text` + `try/except json.loads`로 방어.
+
+### B.5 첫 init은 느림 (~2~3초)
+
+`_ensure_init`이 subprocess spawn + 도구 메타데이터 로드를 수행. **워커 스레드별 첫 호출에서만 발생** → 캐시 히트 후엔 빠름.
+
+> **벤치마크 시 이 첫 호출 비용을 분리**해서 측정할 것. 평균에 섞이면 도구 호출 자체가 느린 것처럼 보임.
+> 
+
+### B.6 인증 정보 누락 시 init은 성공, 호출에서 실패
+
+환경변수를 빠뜨려도 subprocess는 일단 뜸 (도구 메타데이터까지는 인증 불필요). **실제 도구 호출 단계에서 401/403 에러** 발생.
+
+**대응**: wrapper에 `try/except`로 감싸고 fail-soft (시뮬레이션은 계속 진행).
+
+### B.7 OpenAI Responses API stall (LLM-driven 한정)
+
+`deepagents`가 모델명에 `"openai:"` prefix를 쓸 때 OpenAI Responses API(SSE 스트림)를 사용. **스트림이 stall되면 OpenAI SDK 디폴트 timeout이 600초 × 재시도 2회 → 최악 30분 무응답**.
+
+**대응**: 클라이언트 측에 `asyncio.wait_for(coro, timeout=N)` 안전망 필수. 본 가이드는 90초로 설정 (`confluence_mcp/llm_personality.py`).
+
+```python
+result = await asyncio.wait_for(
+    agent.ainvoke({...}),
+    timeout=90,  # ← 안전망
+)
+```
+
+## C. MCP 서버 프레임워크 선택지
+
+직접 구현 시 어떤 프레임워크를 쓸지에 대한 선택지. 본 가이드는 FastMCP를 사용했지만, 다른 옵션도 있음.
+
+### C.1 Python 옵션
+
+| 프레임워크 | 패키지 | 특징 | 적합한 경우 |
+| --- | --- | --- | --- |
+| **FastMCP (별도 패키지)** ⭐ | `pip install fastmcp` | jlowin이 만든 가장 인기 있는 Python 프레임워크. FastAPI 스타일 데코레이터 (`@mcp.tool`). 본 가이드 사용. 기능 풍부 | 빠른 작성, 풍부한 기능 |
+| **공식 SDK 내장 FastMCP** | `pip install mcp` → `from mcp.server.fastmcp import FastMCP` | 같은 API지만 Anthropic 공식 SDK에 흡수된 버전 | 외부 의존성 줄이고 공식만 쓰고 싶을 때 |
+| **공식 SDK low-level** | `pip install mcp` → `from mcp.server import Server` | 데코레이터 없이 핸들러 클래스 직접 등록. 가장 verbose하지만 가장 자유롭다 | 표준에서 벗어난 커스터마이징 |
+
+> 셋 다 같은 MCP 프로토콜이라 클라이언트 입장에서는 **구분 불가**. 작성 편의 차이만 있음.
+> 
+
+### 같은 도구를 세 방식으로 등록
+
+본 가이드가 FastMCP를 고른 이유: 도구 3개만 있어 데코레이터 한 줄이 가장 깔끔.
+
+```python
+# FastMCP / 공식 내장 FastMCP — 동일
+@mcp.tool()
+def save_reflection(agent_name: str, day: int, text: str) -> dict:
+    return {...}
+
+# 공식 SDK low-level
+class MyServer(Server):
+    @list_tools()
+    async def list_tools(self):
+        return [Tool(name="save_reflection", inputSchema={...})]
+
+    @call_tool()
+    async def call_tool(self, name, arguments):
+        if name == "save_reflection":
+            return [TextContent(type="text", text=...)]
+```
+
+### C.2 다른 언어
+
+| 언어 | 주요 옵션 | 특징 |
+| --- | --- | --- |
+| TypeScript / Node.js | `@modelcontextprotocol/sdk` (공식) | 가장 활발한 생태계 중 하나 |
+| Java | 공식 SDK + Spring AI MCP | 엔터프라이즈, Spring 프로젝트라면 자연스러움 |
+| C# | 공식 .NET SDK | Microsoft 적극 지원, Semantic Kernel 통합 |
+| Kotlin | 공식 SDK | JetBrains·안드로이드 |
+| Go / Rust | 커뮤니티 (`mcp-go`, `rmcp` 등) | 공식 없음 |
+
+### C.3 디버깅·운영 도구
+
+| 도구 | 용도 |
+| --- | --- |
+| `mcp-inspector` | 만든 MCP 서버를 GUI로 디버깅 — 도구 호출 테스트 |
+| `mcp-proxy` | stdio ↔ SSE/HTTP 프로토콜 변환 |
+| Smithery | MCP 서버 레지스트리 + 설치 CLI (npm 같은 역할) |
 
 💡 단순 코드량은 외부 MCP가 유리. 그 +157줄을 정당화하는 건 1차의 결정 조건 — **호출자에 LLM이 있거나, 여러 클라이언트·언어가 같은 도메인을 공유**해야 함. 둘 다 아니면 외부 MCP가 거의 항상 정답이라는 1차 결론의 코드 레벨 실증.
