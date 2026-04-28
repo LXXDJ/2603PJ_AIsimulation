@@ -11,6 +11,7 @@
     - [6.1 Confluence (mcp-atlassian)](#61-confluence-mcp-atlassian)
     - [6.2 GitLab (zereight/mcp-gitlab)](#62-gitlab-zereightmcp-gitlab)
     - [6.3 Gmail (email-mcp)](#63-gmail-email-mcp)
+    - [6.4 PostgreSQL](#64-postgresql)
 7. [부록](#부록)
     - [A. 양쪽 다 빠지기 쉬운 운영 함정](#a-양쪽-다-빠지기-쉬운-운영-함정)
     - [B. MCP 서버 프레임워크 선택지](#b-mcp-서버-프레임워크-선택지)
@@ -1103,6 +1104,198 @@ https://txid.shop/mcp/hosted/transport?token=a54e8f3430...
 §6.3.5 의 *URL 토큰 평문 노출* 은 사내망에서도 동일하지만 *경계* 가 바뀜 → 외부 CDN·외부 SIEM 으로 토큰이 회사 밖으로 나가는 경로는 사라지고, 대신 사내 SIEM·프록시 가 outbound URL 을 *장기 보관* 하는 경우 퇴직자도 과거 로그에서 추출 가능 (보관 정책은 회사마다 상이)
 
 **완화**: 토큰 회전 주기 단축 + SIEM/프록시의 URL 쿼리 마스킹 정책 사내 합의
+
+## 6.4 PostgreSQL
+
+### 6.4.1 도구 레벨에서 쓰기를 막을 수 없음 → DB 계정 분리가 유일한 방어선
+
+PostgreSQL MCP 는 SQL 을 실행하는 도구를 LLM 에게 노출함. `execute_sql` 같은 도구가 대표적이고, 직접 구현해도 결국 어디간에선 `conn.execute(query)` 가 일어남. **MCP 패키지에 "쓰기 도구만 비활성화" 옵션이 있어도, 도구 인자에 SQL 본문이 그대로 들어가는 한 LLM 이 INSERT/UPDATE/DELETE 를 만들어내는 걸 막을 수 없음.**
+
+해결: PostgreSQL 롤을 SELECT 만 가진 read-only 계정으로 분리하고, 그 계정의 DSN 만 MCP 에 전달. LLM 이 `DROP TABLE` 을 보내도 DB 가 거부.
+
+```sql
+-- read-only 롤
+CREATE ROLE mcp_readonly LOGIN PASSWORD '...';
+GRANT CONNECT ON DATABASE simulation_db TO mcp_readonly;
+GRANT USAGE ON SCHEMA public TO mcp_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO mcp_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO mcp_readonly;
+```
+
+```bash
+# ❌ 쓰기 계정 → 절대 금지
+MCP_DATABASE_URL=postgresql://writer_app:pw@localhost/simulation_db
+
+# ✅ read-only 계정만
+MCP_DATABASE_URL=postgresql://mcp_readonly:pw@localhost/simulation_db
+```
+
+**폴백 차단이 핵심**: `MCP_DATABASE_URL` 누락 시 쓰기 계정인 `DATABASE_URL` 로 자동 연결되지 않게 강제 → 환경변수 1개만 빠뜨려도 조용히 쓰기 계정으로 떨어지면 분리 자체가 무의미.
+
+### 6.4.2 statement_timeout 기본값이 0 (무제한) → 잘못된 쿼리가 stdio 세션을 통째로 잠금
+
+PostgreSQL 의 쿼리 타임아웃은 기본 0(무제한). `JOIN` 하나 잘못 짜면 30분짜리 쿼리가 돌고, stdio 세션이 그 시간 동안 묶여서 Claude Code 는 응답을 기다림. Ctrl+C 는 클라이언트만 끊을 뿐 서버 쿼리는 계속 돌아가서 DB 부하만 누적.
+
+해결: DB 롤 레벨과 세션 레벨 양쪽에 타임아웃을 걸어 defense-in-depth.
+
+```sql
+-- DB 롤 레벨
+ALTER ROLE mcp_readonly SET statement_timeout = '5s';
+ALTER ROLE mcp_readonly SET lock_timeout = '1s';
+ALTER ROLE mcp_readonly SET idle_in_transaction_session_timeout = '10s';
+```
+
+```python
+# 연결 직후 세션 단위
+await conn.execute("SET statement_timeout = '5s'")
+await conn.execute("SET lock_timeout = '1s'")
+```
+
+이러면 한쪽 누락돼도 다른 쪽이 잡음. 운영 환경에선 5s 가 보수적이고, 분석 쿼리가 있으면 30s ~ 60s 까지 상향 검토.
+
+### 6.4.3 결과 행 수 제한이 없음 → LLM 컨텍스트 폭발
+
+`SELECT * FROM logs` 가 100만 행 테이블에 던져지면 응답 전체가 LLM 컨텍스트로 흘러 들어감. `statement_timeout` 으로는 행 수도 못 막음 (5초 안에 100만 행 반환 가능).
+
+해결은 차원별:
+
+| 차원 | 수단 |
+| --- | --- |
+| 도구 레벨 강제 | wrapper 가 SQL 에 `LIMIT 200` 강제 삽입 |
+| 시스템 프롬프트 규칙 | "항상 `LIMIT` 을 절 붙여라" |
+| 응답 후처리 | 응답 행 수 N 초과 시 wrapper 가 truncate + 경고 |
+| DB 측 제한 | `work_mem` 튜닝 (PG 자체에 max_rows 없음) |
+
+```python
+# 도구 안에서 강제 + 절단 신호 반환
+async def query_results(run_id: int):
+    sql = "SELECT * FROM agent_results WHERE run_id = $1 LIMIT 200"
+    rows = await conn.fetch(sql, run_id)
+    if len(rows) == 200:
+        return {"rows": rows, "warning": "결과가 200행에서 잘렸음. 더 좁은 조건 권장."}
+    return {"rows": rows}
+```
+
+도구 레벨에서 강제할 수 있는 환경이라면 시스템 프롬프트 규칙이 한계 → 규칙이 안 지켜지면 그대로 사고. 강한 보장이 필요하면 wrapper 에서 SQL 을 가로채 LIMIT 를 주입하는 구조로 가야 함.
+
+### 6.4.4 JSONB 컬럼은 이스케이프된 문자열로 옴 (드라이버 직렬화 함정)
+
+PostgreSQL 의 JSONB 컬럼은 SQL 결과가 JSON 으로 직렬화될 때 *중첩 객체* 가 아니라 *이스케이프된 JSON 문자열* 로 옴. asyncpg·psycopg 둘 다 기본 동작이 동일. LLM 이 `row.config.agent` 처럼 바로 접근하려 하면 실패하고, 반복적으로 같은 컬럼을 다시 파싱하느라 호출 비용이 늘어남.
+
+```python
+# 실제 응답 형태
+{
+    "id": 1,
+    "config": "{\"agent\": \"정치학\", \"reflection\": true}",  # ← 문자열
+}
+
+# 한 단계 더 파싱 필요
+import json
+config_obj = json.loads(row["config"])
+```
+
+해결: wrapper 에서 자동으로 파이즈 시 디코드 등록된 구조라면 도구가 응답하기 전에 dict 로 복원.
+
+```python
+# JSONB 자동 디코드 등록
+await conn.set_type_codec(
+    "jsonb", encoder=json.dumps, decoder=json.loads,
+    schema="pg_catalog",
+)
+```
+
+이 변환을 끼워 넣을 위치가 없는 구조라면 시스템 프롬프트에 "JSONB 컬럼은 다시 JSON 파싱해야 함" 명시가 차선. `BYTEA` 도 비슷하게 base64/hex 문자열로 오는 같은 처리 필요.
+
+### 6.4.5 list_tables 는 search_path 안의 스키마만 보임
+
+PostgreSQL 의 한 DB 에 여러 스키마(`public`, `audit`, `analytics`, `staging` 등)를 둘 수 있음. `list_tables` 의 `information_schema` 기본 쿼리는 *연결 계정의 `search_path`* (기본값 `"$user", public`) 안에 있는 스키마만 조회 → 다른 스키마의 테이블은 LLM 이 존재 자체를 모름.
+
+```sql
+-- 해결 1: 계정의 search_path 명시 확장 (가장 깔끔)
+ALTER ROLE mcp_readonly SET search_path TO public, audit, analytics;
+
+-- 해결 2: information_schema 직접 조회 (한 번만 알려주면 LLM 이 학습)
+SELECT table_schema, table_name FROM information_schema.tables
+WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY table_schema, table_name;
+```
+
+LLM 이 "이 DB 에 어떤 테이블 있어?" 물을 때 search_path 밖 테이블이 누락된 답을 받으면, 사용자는 그 테이블이 없다고 오해. 시스템 프롬프트에 "스키마 명시 필요 → public 외 스키마는 `audit.events` 처럼 fully-qualified 로 호출" 안내 권장.
+
+### 6.4.6 TIMESTAMPTZ 직렬화 → 세션 timezone 에 따라 시간이 어긋나 보임
+
+`TIMESTAMP WITH TIME ZONE` 컬럼은 PostgreSQL 내부적으로 UTC 로 저장되고, 클라이언트로 응답할 때 *세션 timezone* 으로 변환되어 직렬화됨. 세션 기본값은 서버 timezone (대부분 UTC) → KST 로 입력한 데이터를 조회해도 응답은 UTC 로 옴. LLM 이 받는 timestamp 와 사용자가 기대한 "오늘" 사이에 9시간 어긋남.
+
+```python
+# 저장 시
+INSERT INTO events (created_at) VALUES ('2026-04-28 14:30:00+09:00');
+
+# 조회 응답 (세션 UTC 기본)
+{"created_at": "2026-04-28T05:30:00+00:00"}  # ← UTC 로 변환
+```
+
+```sql
+-- 해결 1: 세션에서 timezone 강제 (연결 직후 실행)
+SET TIME ZONE 'Asia/Seoul';
+
+-- 해결 2: 쿼리에서 명시 변환
+SELECT created_at AT TIME ZONE 'Asia/Seoul' AS created_kst FROM events;
+```
+
+`TIMESTAMP` (without time zone) 컬럼은 더 위험 → 이는 timezone 인지 컬럼이 아예 못해 호출자가 가정한 timezone 과 어긋날 수 있음. 컬럼 설계 단계에서 `TIMESTAMPTZ` 통일 권장.
+
+### 6.4.7 DSN 이 CLI 인자·환경변수로 노출됨 (알려진 트레이드오프)
+
+**상황** → DSN 은 호스트·계정·비밀번호를 한 문자열에 담음 (`postgresql://user:pw@host/db`). 다음 경로로 노출됨:
+
+- **설정 파일 git 커밋** → 하드코딩 시 비밀번호가 이력에 영구 남음
+- **OS 프로세스 목록** → `ps aux` 가 치환된 DSN 을 그대로 보여줌. 멀티유저 서버에서 다른 사용자가 조회 가능
+- **셸 히스토리** → `MCP_DATABASE_URL=...` 을 인라인으로 export 하면 `~/.zsh_history` 에 남음
+- **에러 로그** → connection 실패 시 스택 트레이스에 DSN 이 그대로 찍히는 라이브러리 있음
+
+```bash
+# ❌ git 노출
+"--dsn", "postgresql://mcp_readonly:password@localhost/simulation_db"
+
+# ✅ 환경변수 치환 + .env (.gitignore)
+"--dsn", "${MCP_DATABASE_URL}"
+```
+
+**완화 수단** → 차원별:
+
+| 차원 | 수단 | 동작 |
+| --- | --- | --- |
+| 자격증명 자체 | read-only 계정 분리 | DSN 이 새도 쓰기 불가 (§6.4.1) |
+| 파일 노출 | `.env` + `.gitignore` | 평문이지만 git 미반영 |
+| 프로세스 노출 | dedicated user 로 실행 | 같은 user 만 `ps` 로 봄 |
+| 영구 보관 | OS keyring / Vault / KMS | DSN 을 디스크 평문으로 안 둠 |
+
+DSN 을 클라이언트가 직접 들고 있어야 하는 구조라면 위 노출 경로를 모두 다 안게 됨. 서버가 DSN 을 내장하고 클라이언트는 Bearer 토큰만 알면 되는 구조로 가면 DB 자격증명이 클라이언트 머신에 전혀 닿지 않음.
+
+### 6.4.8 감사 로그 → 도구 레벨 기록은 직접 구현으로만
+
+"누가 언제 어떤 도구를 호출하고 응답이 몇 행이었나" 의 추적은 일반적인 MCP 패키지 안에서 불가능. PostgreSQL `log_statement = 'all'` + `pg_stat_statements` 로 SQL 본문은 잡히지만 *도구 이름·응답 행 수·소요 시간·성공 여부* 는 빠짐.
+
+해결: wrapper 에 자체 감사 로그를 끼워 모든 도구 호출이 한 줄씩 `tool_call_log` 에 들어가게 함.
+
+```python
+# 모든 도구 호출이 자동 기록
+@mcp.tool()
+async def compare_personalities(run_id: int):
+    t0 = time.monotonic()
+    async with await _connect() as conn:
+        try:
+            result = await conn.fetch(SQL, run_id)
+            await _log(conn, "compare_personalities", len(result),
+                       int((time.monotonic() - t0) * 1000), True)
+            return result
+        except Exception as e:
+            await _log(conn, "compare_personalities", 0,
+                       int((time.monotonic() - t0) * 1000), False, str(e))
+            raise
+```
+
+호출자(LLM) 는 신경 쓸 필요 없고, `tool_call_log` 만 보면 도구 이름·인자 해시·응답 행 수·시간·성공 여부가 다 잡힘. 컴플라이언스 환경(금융·의료) 에서는 이 패턴이 사실상 필수.
 
 # **부록**
 
