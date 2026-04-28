@@ -10,6 +10,7 @@
 6. [서비스별 유의사항](#6-서비스별-유의사항)
     - [6.1 Confluence (mcp-atlassian)](#61-confluence-mcp-atlassian)
     - [6.2 GitLab (zereight/mcp-gitlab)](#62-gitlab-zereightmcp-gitlab)
+    - [6.3 Gmail (email-mcp)](#63-gmail-email-mcp)
 7. [부록](#부록)
     - [A. 양쪽 다 빠지기 쉬운 운영 함정](#a-양쪽-다-빠지기-쉬운-운영-함정)
     - [B. MCP 서버 프레임워크 선택지](#b-mcp-서버-프레임워크-선택지)
@@ -943,6 +944,165 @@ GITLAB_API_URL=https://gitlab.사내.com/api/v4
 ```
 
 단 사내 GitLab 버전이 구버전이면 일부 엔드포인트 미지원. 예를 들어 zereight가 GitLab 17.x 가정인데 사내가 15.x이면 일부 도구가 404. 호환되는 zereight 버전을 골라 lock 필요.
+
+## 6.3 Gmail (email-mcp)
+
+> ℹ️ 이 절이 가정하는 구조: `email-mcp` 는 `send_mail` 도구 1개를 두 가지 transport 로 제공함 → 사용자 PC 에서 직접 실행하는 **stdio** (자격증명은 본인 `.env` 에 보관) 와 EC2 가 호스팅해 URL 한 줄로 연결하는 **hosted** (자격증명은 서버에 Fernet 암호화 저장)
+
+### 6.3.1 SMTP 로그인은 앱 암호 16자리만 받음 (계정 비번 차단)
+
+`SMTP_PASS` 에 계정 비번을 넣으면 100% 실패 (`SMTPAuthenticationError: 535 ... Username and Password not accepted`)
+
+우회 방법: Google 계정 → 보안에서 2단계 인증을 켜고 https://myaccount.google.com/apppasswords 에서 앱 암호를 발급, 공백 제거한 16자리를 사용
+
+```bash
+# ❌ 계정 비번
+SMTP_PASS=mygooglepw123!
+
+# ✅ 앱 암호 (공백 제거한 16자리)
+SMTP_PASS=abcdefghijklmnop
+```
+
+발급 절차는 stdio·hosted 모두 동일 → stdio 사용자는 `.env` 의 `SMTP_PASS` 에 직접 넣고, hosted 사용자는 admin 에 전달해 `mcp_hosted_auth.py:register_user()` 가 Fernet 으로 암호화해 MongoDB 에 저장
+
+SMTPAuthenticationError 가 뜨면 99% 발급·입력 문제이므로 코드부터 의심하지 말 것
+
+### 6.3.2 `from_address` 는 자유롭지 않음 (Gmail 이 본인 명의 외 발송을 차단)
+
+Gmail SMTP 는 인증한 계정과 다른 명의를 거부하거나 `From` 을 본인 주소로 강제 변환함
+
+우회 방법: 본인 Gmail 명의를 그대로 쓰거나, Workspace *"다른 주소에서 메일 보내기"* alias 로 등록한 도메인만 사용
+
+```python
+# .env (stdio)
+SMTP_USER=alice@gmail.com
+
+# ❌ 임의의 회사 도메인 → Gmail 이 거부 또는 alice@gmail.com 으로 덮어씀
+FROM_ADDRESS=alice@atdev.co.kr
+
+# ✅ 본인 Gmail 또는 Workspace alias 로 등록한 도메인
+FROM_ADDRESS=alice@gmail.com
+```
+
+코드 경로는 stdio = `email_mcp/server.py:_config()` 가 `.env` 의 `FROM_ADDRESS` 를 읽고 (기본값은 `SMTP_USER` 와 동일, `:23`), hosted = `mcp_hosted_server.py:84` 가 등록 시 저장된 `creds["from_address"]` 를 읽음
+
+hosted 에서 `FROM_ADDRESS` 를 바꾸려면 사용자가 직접 못 하고 admin 이 `/admin/mcp/users/{user_id}` DELETE 후 재등록 (토큰 재발급)
+
+회사 도메인 발송은 Workspace alias + SPF/DKIM 설정이 같이 필요하고, 익명 대표 메일(예: `noreply@회사.com`) 은 Gmail SMTP 로는 불가 → `smtp.gmail.com` 대신 SendGrid·AWS SES 같은 transactional 발송 서비스로 백엔드를 갈아끼워야 제공됨 (도메인의 SPF/DKIM 만 걸면 그 도메인의 모든 주소를 발신 명의로 사용 가능)
+
+### 6.3.3 cc/bcc 수신자 제한 강도 — 코드 정책
+
+메일 발송 서비스는 *공급자 한도*(Gmail 무료 500/일, Workspace 2000/일) 와는 별개로 자체 코드 정책으로 수신자 수·발송량을 좁히는 게 일반적 → 한 번에 잘못된 호출이 전체 일일 한도를 까먹는 걸 막기 위해
+
+stdio·hosted 양쪽 모두 cc/bcc 가 5명을 넘으면 즉시 거부함 → defense-in-depth
+
+```python
+# email_mcp/server.py:35-38 (stdio)  /  mcp_hosted_server.py:67-70 (hosted)
+if cc and len(cc) > 5:
+    return {"ok": False, "error": "cc 수신자는 최대 5개"}
+if bcc and len(bcc) > 5:
+    return {"ok": False, "error": "bcc 수신자는 최대 5개"}
+```
+
+강도를 적용하는 일반 패턴:
+- **Form-level 검증** → UI 입력 단계부터 N개 이상 못 넣게 막음
+- **Rate limit** → 사용자별·IP별 시간당 N통 (sliding window)
+- **Queue + retry** → 대량은 즉시 거부 대신 큐로 분산
+- **Newsletter 분리** → 100명 넘는 발송은 별도 마케팅 인프라(Mailchimp·SendGrid Marketing)
+
+`email-mcp` 의 5명은 보수적 임계값 → 정책 완화 시 rate limit 도 같이 검토 (코드만 풀면 일일 한도 사고 위험)
+
+### 6.3.4 HTML + plain text alternative 자동 처리
+
+HTML 단독 메시지는 RFC 2046 멀티파트 alternative 누락으로 스팸 폴더에 떨어지기 쉬움
+
+`email-mcp` 는 `set_content`(plain) + `add_alternative`(HTML) 패턴으로 자동 조립 → stdio·hosted 동일
+
+```python
+# email_mcp/server.py:51-52 (stdio)  /  mcp_hosted_server.py:89-90 (hosted)
+msg.set_content("이 메시지는 HTML 형식입니다. HTML 지원 클라이언트에서 확인하세요.")
+msg.add_alternative(body_html, subtype="html")
+```
+
+호출자는 HTML 한 덩어리만 넘기면 되고 plain text fallback 은 라이브러리가 끼워줌 → wrapper 에서 이중으로 plain text 를 또 넣지 말 것
+
+> ℹ️ 여기서 *라이브러리* 는 Python 표준 라이브러리 `email` 모듈 (`email.message.EmailMessage`) → multipart/alternative 헤더·boundary·각 파트의 transfer encoding(quoted-printable 등) 조립은 stdlib 내부에서 처리 → 외부 의존성이 아니라 stdlib 라 어디서든 같은 패턴을 그대로 사용 가능 → `aiosmtplib` 은 완성된 `EmailMessage` 를 직렬화해 SMTP 로 *전송* 만 담당
+
+### 6.3.5 호스팅 토큰이 URL 쿼리에 노출됨 (알려진 트레이드오프)
+
+**상황** → hosted 모드는 `?token=…` 형태로 토큰을 URL 에 *평문* 으로 붙임 → 주요 노출 경로:
+- **HTTP 프록시·CDN·SIEM 로그** → 회사 보안 장비가 outbound URL 을 평문 기록·보관
+- **MCP 클라이언트 설정 파일** → `claude_desktop_config.json` 등에 URL 평문 저장 (스크린샷·설정 공유 시 유출)
+- **사용자의 부주의한 공유** → 채팅·이메일·티켓에 연결 URL 을 그대로 붙여넣는 경우
+
+```
+https://txid.shop/mcp/hosted/transport?token=a54e8f3430...
+                                              ↑ URL 평문 → 위 경로들로 새어 나갈 수 있음
+```
+
+영향 범위는 *"URL 이 새는 것 = 본인 Gmail 로 누가 메일 보낼 수 있는 것"* → 호스팅 사용자에게 발급 시 반드시 이 한 줄로 안내
+
+**왜 헤더 방식이 아닌가 (설계 배경)** → Claude Desktop·Cursor 등 MCP 클라이언트가 transport 호출 시 임의 HTTP 헤더 주입을 잘 지원하지 않아 호환성을 위해 URL 쿼리 방식 채택 → 헤더 방식이 더 안전하지만 클라이언트 생태계가 따라오지 못해서 보류
+
+**완화 수단** → 서로 다른 차원에서 피해를 줄이는 4가지:
+
+| 차원 | 수단 | 동작 |
+|---|---|---|
+| 사고 대응 | 토큰 회전 | 분실·노출 의심 시 `/admin/mcp/users/{user_id}` DELETE → 동일 user_id 재등록 → 신규 토큰 발급 (기존 즉시 무효) |
+| 사전 피해 회전 | Rate limit | `rate_limit_per_hour` 로 토큰이 새도 피해 범위 제한 (등록 시 admin 이 사용자별로 설정) |
+| 서버 측 위생 | 로그 마스킹 | 서버 로그에 앞 6자만 (`mcp_hosted_auth.py:_mask_token`) |
+| 사용자 행동 | URL 공유 금지 | 채팅·메일·티켓에 그대로 붙이지 않고 1:1 전달 |
+
+---
+
+#### 사내망에 동일 패턴 이전 시 유의사항
+
+본 프로젝트의 hosted 부분(FastMCP + MongoDB + Fernet + EC2 + Gmail) 을 사내로 옮길 때, *코드를 그대로 들고 갈 수도* 있고 *동일 패턴을 사내 표준 스택으로 다시 구현할 수도* 있음 → 사내 표준이 Python·MongoDB·FastAPI 와 다를 가능성을 전제로, 어느 쪽이든 보존해야 할 책임과 갈아끼울 수 있는 부분을 구분해 정리
+
+### 6.3.6 보존해야 할 책임 (구현 무관)
+
+스택을 무엇으로 바꾸더라도 다음 5가지 책임은 어떤 형태로든 구현돼 있어야 hosted 모드의 보안·운영 모델이 유지됨:
+
+| 책임 | 본 프로젝트 구현 | 다른 구현 예시 |
+|---|---|---|
+| 자격증명 암호화 저장 | MongoDB + Fernet (애플리케이션 레벨) | RDB + pgcrypto/컬럼 암호화 / KMS 호출 후 저장 |
+| 토큰 → 자격증명 매핑 | Mongo 컬렉션 1개 | RDB 테이블 / Redis Hash |
+| Rate limit | 인메모리 (토큰별 시간창) | Redis sliding window |
+| 감사 로그 | `last_used_at` 필드 | 별도 로그 인덱스 / SIEM 포워딩 |
+| 메일 발송 | `aiosmtplib` (Python, SMTP) | JavaMail / Microsoft Graph / 사내 메일 API |
+
+### 6.3.7 갈아끼울 수 있는 부분
+
+사내 표준이 다르면 동일 책임을 다른 도구로 함:
+
+- **언어·프레임워크** → 본 코드는 Python + FastMCP/FastAPI. 사내 표준이 Java/Spring, Go/Gin, .NET 이라면 같은 책임을 그쪽으로 재구현
+- **DB** → MongoDB 가 사내 표준 아니면 PostgreSQL/Oracle/MySQL 등으로 교체 → 자격증명 암호화는 *애플리케이션 레벨*(Fernet 등 라이브러리, 본 프로젝트 방식) 또는 *DB 컬럼 암호화*(pgcrypto 등) 중 선택
+- **비밀 관리** → Fernet 키 보관을 환경변수에서 사내 Vault/KMS 로 이관하는 게 일반적 → 키 회전 정책도 합의
+- **메일 백엔드** → 사내 메일 인프라가 SMTP 가 아닌 API 기반(예: Microsoft Graph) 이면 발송 호출부 전체를 그 SDK 로 교체
+- **HTTP transport** → FastMCP streamable-http 가 아닌 사내 표준 웹 프레임워크로 MCP transport 만 다시 노출
+
+### 6.3.8 메일 백엔드 교체 시 quirks 변화
+
+§6.3.1 (앱 암호) 와 §6.3.2 (From-address 강제) 는 *Gmail 특유 제약* → 백엔드가 바뀌면 이 quirks 들이 다른 quirks 로 대체됨:
+
+- **사내 SMTP relay (Postfix·Exchange 등)**: 보통 시스템 계정(`noreply@회사.com`) 명의로 익명 발신 → 인증은 IP 화이트리스트 또는 XOAUTH2
+- **Microsoft Graph (Exchange Online)**: SMTP 가 아니라 REST API. `aiosmtplib.send()` 호출부 전체 재작성, 자격증명도 OAuth 2.0 access token 으로 변경
+- **사내 자체 메일 게이트웨이**: 회사가 만든 내부 발송 API 가 있다면 그 명세 따름
+
+§6.3.3 (cc/bcc 강도), §6.3.4 (multipart/alternative) 는 메일 표준 일반에 적용되므로 백엔드 교체와 무관
+
+### 6.3.9 인증 통합 — 사내 IdP 활용 (admin 발급 → self-service)
+
+원래 hosted 토큰은 admin 이 사용자에게 발급하는 구조 (MVP 단계 간소화) → 사내망은 보통 SSO(SAML/OIDC)·LDAP/AD 가 있어 사용자 신원 확인이 *공짜* 라, *self-service 등록* 으로 자연스럽게 전환 가능:
+- 사용자가 사내 SSO 로 로그인 → 자기 메일 자격증명 입력 폼 → 토큰 자동 발급
+- admin 단계 제거 → 사용자별 토큰·rate limit·last_used_at 추적은 §6.3.6 책임 그대로 유지
+- 회수: 사용자 본인 또는 admin
+
+### 6.3.10 토큰 노출 위험의 재해석
+
+§6.3.5 의 *URL 토큰 평문 노출* 은 사내망에서도 동일하지만 *경계* 가 바뀜 → 외부 CDN·외부 SIEM 으로 토큰이 회사 밖으로 나가는 경로는 사라지고, 대신 사내 SIEM·프록시 가 outbound URL 을 *장기 보관* 하는 경우 퇴직자도 과거 로그에서 추출 가능 (보관 정책은 회사마다 상이)
+
+**완화**: 토큰 회전 주기 단축 + SIEM/프록시의 URL 쿼리 마스킹 정책 사내 합의
 
 # **부록**
 
