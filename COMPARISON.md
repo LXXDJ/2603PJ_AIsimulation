@@ -7,10 +7,12 @@
 3. [각 방식의 특징과 장단점](#3-각-방식의-특징과-장단점)
 4. [어떻게 선택할 것인가](#4-어떻게-선택할-것인가)
 5. [코드로 보는 차이](#5-코드로-보는-차이)
-6. [부록](#부록)
-    - [A. Confluence(`mcp-atlassian`) 사용 시 알아야 할 것](#a-confluencemcp-atlassian-사용-시-알아야-할-것)
-    - [B. 양쪽 다 빠지기 쉬운 운영 함정](#b-양쪽-다-빠지기-쉬운-운영-함정)
-    - [C. MCP 서버 프레임워크 선택지](#c-mcp-서버-프레임워크-선택지)
+6. [서비스별 유의사항](#6-서비스별-유의사항)
+    - [6.1 Confluence (mcp-atlassian)](#61-confluence-mcp-atlassian)
+    - [6.2 GitLab (zereight/mcp-gitlab)](#62-gitlab-zereightmcp-gitlab)
+7. [부록](#부록)
+    - [A. 양쪽 다 빠지기 쉬운 운영 함정](#a-양쪽-다-빠지기-쉬운-운영-함정)
+    - [B. MCP 서버 프레임워크 선택지](#b-mcp-서버-프레임워크-선택지)
 
 # 1. MCP란 무엇인가
 
@@ -390,6 +392,57 @@ def save_reflection(agent_name: str, day: int, text: str):
 - **여러 외부 시스템을 한 번씩 통합.** Slack 알림 + Jira 코멘트 + GitHub 이슈처럼 시스템마다 호출 1~2회면 도메인 변환 비용이 작음 → 시스템마다 직접 만들면 서버 N개 작성·유지가 부담.
 - **호출자가 전부 코드인 환경.** 도메인 변환을 helper 함수로 응집할 수 있어 단점이 완화됨.
 
+<details>
+<summary><strong>실제 도입 시 보안·운영 유의점</strong></summary>
+
+### ▸ 써드파티 MCP 사용 시 유의점
+
+| 항목 | 내용 |
+| --- | --- |
+| **제작 주체** | 대부분 개인 개발자. 사용자 수 많아도 그게 안전성 보증은 아님 |
+| **token/비밀값 노출** | 모르는 코드에 API 토큰/비밀값을 넘김. 코드 검토 전엔 어디로 새는지 모름 |
+| **공급망 공격** | npm/pypi 자동 업데이트로 어느 날 악성 코드가 깔릴 수 있음 (`event-stream`, `ua-parser-js` 등 실제 사례) |
+| **유지보수 의존성** | 메인테이너 한 명/소수에 달려 있음. 이직·번아웃하면 외부 API 변경 추적, 버그·보안 패치 모두 멈춤 — 긴급 픽스 보장 없음 |
+| **MCP 명세 추종 지연** | 명세 업데이트가 패키지에 반영 안 되면 호환성 깨질 수 있음 |
+| **도구 과다 노출** | 노출 도구가 많을수록 위험한 write 도구도 LLM에 보임 → 티어 차단 같은 별도 가드 필요 |
+
+#### 운영 도입 시 권장
+
+- **소스 코드 검토** (최소 main 로직, 인증/네트워크 부분)
+- **사내 fork 및 버전 lock** (사내 저장소/사내 레지스트리에 미러, 외부 자동 업데이트 차단)
+- **티어 차단** (위험 도구 LLM 노출 안 함)
+- **감사 로그** (모든 tool_call 영속 기록)
+
+---
+
+### ▸ 사내망(폐쇄망)에서 외부 MCP 사용 시 특징/유의점
+
+#### 기본 전제
+
+- "외부 MCP" = 코드 출처가 외부일 뿐, **실행은 본인 환경에서** 일어남 (stdio transport는 부모-자식 프로세스 파이프라 같은 머신에서 동작)
+- MCP 서버가 호출하려는 대상 시스템(사내 API/사내 서비스 등)에 네트워크적으로 도달해야 하므로 **그 시스템에 라우팅 가능한 위치에서 spawn돼야** 함
+- 즉 **MCP 서버가 도는 컴퓨터에서 대상 시스템으로 패킷이 갈 수 있어야** 한다는 뜻. 사내 자원이면 그 컴퓨터가 사내 네트워크 안에 있거나(사내 서버, 사내 노트북) VPN으로 사내망에 들어와 있어야 함
+
+#### 두 축이 다 만족돼야 함
+
+| 축 | 내용 |
+| --- | --- |
+| **소스 위치** (어디서 다운) | 공개 패키지 레지스트리 직접 X → **사내 패키지 레지스트리** (Verdaccio, Artifactory, Nexus 등)에서 다운 |
+| **실행 위치** (어디서 spawn) | 외부 클라우드 X → **사내망 안 머신** (사내 노트북, 사내 서버, VPN 연결 노트북, 사내 K8s, 사내 VPC) |
+
+#### 사내 시스템(self-hosted) 일반 유의사항
+
+| 항목 | 내용 |
+| --- | --- |
+| **API URL 변경** | 환경변수의 엔드포인트를 사내 도메인으로 변경 (예: `*.사내.com/...`) |
+| **버전 호환** | 사내 시스템이 구버전이면 외부 패키지가 가정한 API와 불일치 → 일부 도구 404. 호환 버전 lock |
+| **사내 인증서** | 사설 CA로 HTTPS면 `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` 환경변수에 사내 CA 추가 |
+| **사내 프록시** | 외부 통신이 프록시 거치면 `HTTP_PROXY`, `HTTPS_PROXY` 설정 |
+| **사내 SSO** | LDAP/SAML 환경에선 토큰 발급/만료 정책이 SaaS와 다를 수 있음 |
+| **사내 커스터마이징** | 사내용 패치/플러그인이 있으면 외부 패키지가 그 기능 못 다룸 → 직접 구축 보충 필요 |
+
+</details>
+
 ## 3.2 직접 구현 MCP 서버
 
 ### 장점
@@ -702,11 +755,11 @@ def update_page(page_id, title, html_body, current_version) -> dict:
 - **클라이언트만 보면**: 직접 구현이 −146줄(약 38% 감소). 도메인 변환을 서버로 옮긴 결과.
 - LLM-driven 파일도 같은 방향: 외부 126줄 vs 직접 93줄(−33줄). 시스템 프롬프트가 짧아졌다 = LLM에 인프라 인자를 안 가르쳐도 된다는 뜻.
 
-# **부록**
+# 6. 서비스별 유의사항
 
-## **A. Confluence(`mcp-atlassian`) 사용 시 알아야 할 것**
+## 6.1 Confluence (mcp-atlassian)
 
-### **A.1 검색이 신뢰할 수 없음 (CQL 인덱싱 지연)**
+### 6.1.1 검색이 신뢰할 수 없음 (CQL 인덱싱 지연)
 
 `confluence_search` 도구는 Confluence의 CQL(Confluence Query Language)을 사용. 그런데 페이지 생성 직후 바로 검색하면 **빈 결과가 나오는 경우가 있음** — Confluence의 검색 인덱스가 갱신되는 데 시간이 걸리기 때문.
 **우회 방법**: 부모-자식 관계를 만들고 `confluence_get_page_children`을 사용. 인덱싱과 무관하게 즉시 조회 가능.
@@ -719,13 +772,13 @@ results = confluence_search(cql=f'title="{title}" AND space="{SPACE_KEY}"')
 children = confluence_get_page_children(parent_id=PARENT_PAGE_ID)
 ```
 
-### A.2 응답 형식이 도구마다 일관되지 않음
+### 6.1.2 응답 형식이 도구마다 일관되지 않음
 
 24개 도구가 응답을 **plain string / JSON 문자열 / 리스트** 등 서로 다른 모양으로 반환. 도구마다 파싱 코드가 따로 필요함.
 
 **대응**: `_unwrap_text` 같은 정규화 함수를 wrapper에 만들어 응답을 일관된 형태로 변환. 본 가이드의 `confluence_official.py`에서 이 함수가 사실상 필수 보일러플레이트.
 
-### A.3 응답 안에 또 JSON 문자열이 들어 있음
+### 6.1.3 응답 안에 또 JSON 문자열이 들어 있음
 
 `confluence_get_page` 같은 도구는 `text` 필드 안에 JSON 문자열을 다시 넣어 반환. `json.loads`를 한 번 더 해야 실제 데이터가 나옴.
 
@@ -738,7 +791,7 @@ text = result[0]["text"]           # 1차 unwrap
 data = json.loads(text)            # 2차 파싱 필요
 ```
 
-### A.4 `update_page`의 version 자동 처리 (장점 사례)
+### 6.1.4 `update_page`의 version 자동 처리 (장점 사례)
 
 Confluence는 동시 수정 충돌을 막기 위해 **낙관적 락**을 사용. 페이지 갱신 시 현재 version을 받아서 +1해 보내야 함. `mcp-atlassian`은 이걸 **내부에서 자동 처리** — 호출자는 신경 쓸 필요 없음.
 
@@ -752,7 +805,7 @@ await tools["confluence_update_page"].ainvoke({
 })
 ```
 
-### A.5 24개 도구 중 use case에 맞게 선택
+### 6.1.5 24개 도구 중 use case에 맞게 선택
 
 `mcp-atlassian`은 24개 도구를 모두 노출하지만, 실제로 우리 use case에 필요한 건 보통 4~6개. **사람이 직접 골라서 사용**해야 함.
 
@@ -779,9 +832,123 @@ tools_to_use = {
 > **LLM에 24개를 모두 노출하면 잘못된 도구를 고를 위험이 큼.** 코드 호출자는 명시적으로 4개만 쓰면 되지만, LLM이 호출자라면 시스템 프롬프트에서 사용 가능한 도구를 명시적으로 제한하거나, 차라리 직접 구현으로 도메인 도구만 노출하는 게 안전.
 > 
 
-## B. 양쪽 다 빠지기 쉬운 운영 함정
+## 6.2 GitLab (zereight/mcp-gitlab)
 
-### B.1 어댑터는 async-only
+### 6.2.1 벤더 공식 MCP는 Premium 전용
+
+GitLab Inc.가 공식 MCP server를 제공(GitLab Duo MCP, Beta)하지만 Premium 티어 이상($29+/user/월)에서만 사용 가능.
+
+### 6.2.2 zereight는 100+ 도구를 모두 노출 (위험 도구 포함)
+
+mcp-atlassian이 24개를 노출하는 것과 달리 zereight는 GitLab API 거의 전부를 노출(약 104개). `delete_*`, `merge_merge_request`, `push_files`, `fork_*` 같은 위험 도구가 LLM에 그대로 보임.
+
+대응: 이름 접두사 차단으로 LLM 노출 도구 자체를 좁힘. `read` 모드는 모든 쓰기 차단, `write_safe`는 되돌릴 수 있는 쓰기만 허용 식의 티어 정책.
+
+```python
+GITLAB_BLOCK_PREFIXES = {
+    "read":       ("create_", "delete_", "update_", "merge_", "approve_", ...),
+    "write_safe": ("delete_", "merge_merge_", "approve_", "push_files", ...),
+    "full":       (),
+}
+
+all_tools = await client.get_tools()
+safe_tools = [t for t in all_tools if not is_blocked(t.name, TIER)]
+```
+
+LLM에 100+ 노출하면 "이슈 닫아줘" 요청에 `delete_issue`를 잘못 고를 위험. 코드 호출자라면 명시적으로 필요한 도구만 추려서 사용. LLM이 호출자라면 티어 차단 + 시스템 프롬프트로 사용 도구 명시 제한, 또는 도메인 도구만 노출하는 직접 구현이 더 안전.
+
+### 6.2.3 project_id에 슬래시가 들어가 URL 인코딩이 필요
+
+GitLab REST API는 프로젝트를 `group/project` 경로로 식별. 그런데 이 슬래시가 REST URL의 경로 구분자와 충돌해서 그대로 넘기면 404가 발생. 우회 방법: `urllib.parse.quote`로 슬래시를 `%2F`로 인코딩. zereight는 내부에서 자동 처리하지만 직접 구현 시 따로 처리.
+
+```python
+# ❌ 그대로 넘김 — 404
+url = f"{BASE_URL}/projects/june-group3/mcp-test/repository/files/README.md"
+
+# ✅ URL 인코딩
+project = urllib.parse.quote("june-group3/mcp-test", safe="")  # → june-group3%2Fmcp-test
+file_path = urllib.parse.quote("src/main.py", safe="")          # → src%2Fmain.py
+url = f"{BASE_URL}/projects/{project}/repository/files/{file_path}"
+```
+
+### 6.2.4 파일 내용은 항상 base64로 인코딩되어 응답
+
+`get_file_contents`가 raw 텍스트가 아니라 base64 인코딩된 문자열을 반환. 디코딩 단계가 한 번 더 필요함.
+
+대응: `base64.b64decode(content).decode("utf-8")`로 풀어서 사용. zereight는 디코딩까지 처리해서 plain text로 돌려줌. 직접 구현 시 빠뜨리면 LLM이 base64 문자열을 그대로 받아 의미를 모름.
+
+```python
+# 응답 형태
+{
+    "content": "IyBtY3AtdGVzdAoKIyMgR2V0dGluZyBzdGFydGVkCi4uLg==",  # base64
+    "encoding": "base64",
+    "size": 4823,
+}
+
+# 디코딩 필수
+text = base64.b64decode(data["content"]).decode("utf-8")
+```
+
+### 6.2.5 MR/이슈는 `iid`로 호출 (`id`가 아님)
+
+GitLab은 두 가지 ID를 가짐:
+
+- `id` — GitLab 인스턴스 전체에서 고유한 글로벌 ID (DB primary key)
+- `iid` — 프로젝트 안에서만 고유한 일련번호 (UI에 보이는 `!12`, `#34`)
+
+API 호출은 거의 다 `iid` 기준. 사람이 보는 URL의 번호가 `iid`. 헷갈려서 `id` 보내면 다른 MR이 조회되거나 404. 이름은 비슷한데 의미가 완전히 다른 두 식별자라 혼동이 잦음.
+
+```python
+# UI에서 보이는 MR !12를 가져올 때
+await tool.ainvoke({
+    "project_id": "june-group3/mcp-test",
+    "merge_request_iid": 12,                    # iid 사용 — id가 아님
+})
+```
+
+### 6.2.6 인증 헤더 이름이 `PRIVATE-TOKEN`으로 고정
+
+OAuth/JWT에서 흔한 `Authorization: Bearer`가 아님. GitLab만의 헤더 이름.
+
+```python
+# ❌ 다른 API 습관대로 — 401
+headers = {"Authorization": f"Bearer {TOKEN}"}
+
+# ✅ GitLab 표준
+headers = {"PRIVATE-TOKEN": TOKEN}
+```
+
+### 6.2.7 검색은 한 엔드포인트에 `scope` 파라미터로 분기
+
+코드 검색, 이슈 검색, MR 검색이 각각 다른 도구가 아님. 같은 `/search` 엔드포인트에 `scope`만 다르게 보냄. `scope` 누락 시 에러.
+
+```python
+# 파일 내용 검색
+params = {"scope": "blobs", "search": "FastMCP", "ref": "main"}
+
+# 가능한 scope
+# blobs (파일 내용), issues, merge_requests, milestones, notes, wiki_blobs, users, commits
+```
+
+### 6.2.8 SaaS와 Self-hosted는 URL만 다름
+
+API 경로는 동일(`/api/v4/...`). 환경변수만 바꾸면 zereight가 그대로 작동.
+
+```bash
+# SaaS
+GITLAB_API_URL=https://gitlab.com/api/v4
+
+# Self-hosted
+GITLAB_API_URL=https://gitlab.사내.com/api/v4
+```
+
+단 사내 GitLab 버전이 구버전이면 일부 엔드포인트 미지원. 예를 들어 zereight가 GitLab 17.x 가정인데 사내가 15.x이면 일부 도구가 404. 호환되는 zereight 버전을 골라 lock 필요.
+
+# **부록**
+
+## A. 양쪽 다 빠지기 쉬운 운영 함정
+
+### A.1 어댑터는 async-only
 
 `langchain-mcp-adapters`는 **sync 호출을 지원하지 않음**. 모든 도구 호출은 `await`이 필요.
 
@@ -793,7 +960,7 @@ loop = asyncio.new_event_loop()
 result = loop.run_until_complete(tool.ainvoke({...}))
 ```
 
-### B.2 stdio는 thread-safe 하지 않음
+### A.2 stdio는 thread-safe 하지 않음
 
 MCP subprocess는 stdin/stdout이 1쌍 → **여러 스레드가 같은 subprocess를 공유하면 메시지가 인터리빙(섞임)** 됨.
 
@@ -809,7 +976,7 @@ def _ensure_init():
     return _local.tools
 ```
 
-### B.3 Subprocess 환경변수 누락
+### A.3 Subprocess 환경변수 누락
 
 `load_dotenv()`로 환경변수를 로드해도 **spawn된 subprocess에는 자동으로 들어가지 않음**. 명시적으로 `env=` 인자로 전달해야 함.
 
@@ -826,26 +993,26 @@ def _build_subprocess_env():
 > **`PATH`를 빼먹는 게 흔한 실수.** Windows에서 `mcp-atlassian` 실행파일을 못 찾음.
 > 
 
-### B.4 응답 형식 가정 금지
+### A.4 응답 형식 가정 금지
 
 같은 MCP 서버 안에서도 도구마다 응답 모양이 다를 수 있음(외부 MCP는 더 심함). 단순히 `result["text"]` 같은 가정은 위험.
 
 **대응**: `_unwrap_text` + `try/except json.loads`로 방어.
 
-### B.5 첫 init은 느림 (~2~3초)
+### A.5 첫 init은 느림 (~2~3초)
 
 `_ensure_init`이 subprocess spawn + 도구 메타데이터 로드를 수행. **워커 스레드별 첫 호출에서만 발생** → 캐시 히트 후엔 빠름.
 
 > **벤치마크 시 이 첫 호출 비용을 분리**해서 측정할 것. 평균에 섞이면 도구 호출 자체가 느린 것처럼 보임.
 > 
 
-### B.6 인증 정보 누락 시 init은 성공, 호출에서 실패
+### A.6 인증 정보 누락 시 init은 성공, 호출에서 실패
 
 환경변수를 빠뜨려도 subprocess는 일단 뜸 (도구 메타데이터까지는 인증 불필요). **실제 도구 호출 단계에서 401/403 에러** 발생.
 
 **대응**: wrapper에 `try/except`로 감싸고 fail-soft (시뮬레이션은 계속 진행).
 
-### B.7 OpenAI Responses API stall (LLM-driven 한정)
+### A.7 OpenAI Responses API stall (LLM-driven 한정)
 
 `deepagents`가 모델명에 `"openai:"` prefix를 쓸 때 OpenAI Responses API(SSE 스트림)를 사용. **스트림이 stall되면 OpenAI SDK 디폴트 timeout이 600초 × 재시도 2회 → 최악 30분 무응답**.
 
@@ -858,11 +1025,11 @@ result = await asyncio.wait_for(
 )
 ```
 
-## C. MCP 서버 프레임워크 선택지
+## B. MCP 서버 프레임워크 선택지
 
 직접 구현 시 어떤 프레임워크를 쓸지에 대한 선택지. 본 가이드는 FastMCP를 사용했지만, 다른 옵션도 있음.
 
-### C.1 Python 옵션
+### B.1 Python 옵션
 
 | 프레임워크 | 패키지 | 특징 | 적합한 경우 |
 | --- | --- | --- | --- |
@@ -895,7 +1062,7 @@ class MyServer(Server):
             return [TextContent(type="text", text=...)]
 ```
 
-### C.2 다른 언어
+### B.2 다른 언어
 
 | 언어 | 주요 옵션 | 특징 |
 | --- | --- | --- |
@@ -905,7 +1072,7 @@ class MyServer(Server):
 | Kotlin | 공식 SDK | JetBrains·안드로이드 |
 | Go / Rust | 커뮤니티 (`mcp-go`, `rmcp` 등) | 공식 없음 |
 
-### C.3 디버깅·운영 도구
+### B.3 디버깅·운영 도구
 
 | 도구 | 용도 |
 | --- | --- |
