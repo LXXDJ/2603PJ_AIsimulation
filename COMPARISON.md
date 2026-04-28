@@ -12,6 +12,7 @@
     - [6.2 GitLab (zereight/mcp-gitlab)](#62-gitlab-zereightmcp-gitlab)
     - [6.3 Gmail (email-mcp)](#63-gmail-email-mcp)
     - [6.4 PostgreSQL](#64-postgresql)
+    - [6.5 OneDrive (@softeria/ms-365-mcp-server)](#65-onedrive-softeriams-365-mcp-server)
 7. [부록](#부록)
     - [A. 양쪽 다 빠지기 쉬운 운영 함정](#a-양쪽-다-빠지기-쉬운-운영-함정)
     - [B. MCP 서버 프레임워크 선택지](#b-mcp-서버-프레임워크-선택지)
@@ -1296,6 +1297,127 @@ async def compare_personalities(run_id: int):
 ```
 
 호출자(LLM) 는 신경 쓸 필요 없고, `tool_call_log` 만 보면 도구 이름·인자 해시·응답 행 수·시간·성공 여부가 다 잡힘. 컴플라이언스 환경(금융·의료) 에서는 이 패턴이 사실상 필수.
+
+## 6.5 OneDrive (@softeria/ms-365-mcp-server)
+
+### 6.5.1 Microsoft 공식 MCP는 Copilot 라이선스 필수
+
+Microsoft가 공식 MCP server를 제공(Preview)하지만 **M365 Copilot 라이선스($30/user/월, 연간 약정)** 없이는 공식 MCP 서버의 도구 호출 자체가 거부됨. 무료 계정이나 일반 M365 구독으로는 사용 불가.
+
+| | Microsoft 공식 | Softeria 써드파티 |
+|---|---|---|
+| **라이선스** | M365 + Copilot 필요 ($30/user/월) | **불필요** |
+| **인증** | Entra 앱 등록 + 관리자 동의 | **사용자 device code 로그인 (앱 등록 불필요)** |
+| **설정** | Entra 앱 등록 필요 | **npx 한 줄** |
+| **상태** | Preview (프로덕션 비권장) | **안정 버전** (npm 54.9K DL) |
+
+> Copilot 라이선스 없는 환경 → Softeria 써드파티(`@softeria/ms-365-mcp-server`) 사용
+
+### 6.5.2 Softeria는 200+개 도구를 모두 노출 (MS365 전체)
+
+mcp-atlassian이 24개, zereight가 104개인 것과 달리 Softeria는 **MS365 전체 서비스**(OneDrive·Mail·Calendar·Excel·Teams 등)를 커버해 **200+개 도구를 노출**. OneDrive만 필요한데 Mail·Calendar·Teams 도구까지 LLM에 보임.
+
+대응: 이름 기반 필터링으로 OneDrive 관련 도구만 추려서 사용.
+
+```python
+# Softeria 200+ 도구 중 OneDrive 관련만 추리면 약 23개
+ONEDRIVE_TOOL_NAMES = {
+    "login", "verify-login", "logout",
+    "list-folder-files", "search-onedrive-files",
+    "download-onedrive-file-content", "upload-file-content",
+    "create-onedrive-folder", "delete-onedrive-file",
+    # ... 약 23개
+}
+
+all_tools = await client.get_tools()
+onedrive_tools = [t for t in all_tools if t.name in ONEDRIVE_TOOL_NAMES]
+```
+
+> LLM에 200+개 노출하면 "파일 올려줘" 요청에 OneDrive 도구가 아닌 SharePoint·Teams 도구를 고를 위험. 코드 호출자라면 명시적으로 필터링, LLM이 호출자라면 시스템 프롬프트 제한 또는 직접 구현으로 필요한 도구만 노출이 안전.
+
+### 6.5.3 인증은 Device Code Flow → stdio 환경에서 주의
+
+OneDrive(Microsoft Graph API)는 OAuth 2.0 인증이 필수. Softeria와 직접 구현 모두 **Device Code Flow**를 사용 → 사용자가 브라우저에서 별도 URL에 접속해 코드를 입력하는 방식.
+
+**문제**: stdio MCP에서 stdout = JSON-RPC 전용. 로그인 URL·코드를 `print()`로 출력하면 **JSON-RPC 메시지가 깨짐**.
+
+```python
+# ❌ stdout으로 출력 → JSON-RPC 깨짐
+print(f"Visit {url}, enter code: {code}")
+
+# ✅ stderr로 출력 → MCP 통신에 영향 없음
+print(f"Visit {url}, enter code: {code}", file=sys.stderr)
+```
+
+**Device Code Flow 흐름:**
+
+```
+서버 → Microsoft          : device code 요청
+서버 → 사용자 (stderr)     : "브라우저에서 https://microsoft.com/devicelogin 접속, 코드 ABC123 입력"
+사용자 → 브라우저 로그인    : 인증 완료
+서버 → Microsoft 폴링      : access_token 획득 → 디스크 캐시 저장
+이후 호출                   : 캐시 토큰 로드 → 만료 시 refresh_token 자동 갱신
+```
+
+> Softeria 외부 MCP를 쓰더라도 최초 로그인 시 이 흐름이 발생. 로그인 안내 메시지가 stderr로 나오므로 **터미널에서 직접 확인**해야 함. GUI 환경에서는 stderr가 안 보일 수 있어 주의.
+> Streamable HTTP transport에선 stdout이 통신 채널이 아니므로 이 충돌 자체가 발생하지 않음. 단 OneDrive MCP는 사실상 모두 stdio 배포라 거의 모든 사용자가 해당.
+
+### 6.5.4 MSAL 토큰 캐시와 subprocess 격리 문제
+
+MSAL은 토큰을 **메모리 캐시**에 보관. stdio MCP에서 서버가 subprocess로 실행되면 **부모 프로세스와 토큰 캐시가 공유되지 않음** → subprocess가 재시작될 때마다 로그인이 풀림.
+
+대응: **디스크 캐시** → 토큰을 파일로 저장하고 subprocess가 시작할 때 로드.
+
+```python
+TOKEN_CACHE_PATH = Path.home() / ".onedrive_mcp_token_cache.json"
+_cache = msal.SerializableTokenCache()
+
+def _get_app():
+    # subprocess 시작 시 디스크에서 캐시 로드
+    if TOKEN_CACHE_PATH.exists():
+        _cache.deserialize(TOKEN_CACHE_PATH.read_text())
+    return msal.PublicClientApplication(
+        MS_CLIENT_ID, authority=MS_AUTHORITY, token_cache=_cache
+    )
+
+def _save_cache():
+    # Microsoft가 refresh 시 새 refresh_token을 발급하는 경우가 있으므로 갱신 후 반드시 재저장
+    if _cache.has_state_changed:
+        TOKEN_CACHE_PATH.write_text(_cache.serialize())
+```
+
+> 디스크 캐시 파일에는 **refresh_token이 평문으로 저장**됨. 프로덕션에서는 파일 권한 제한(`chmod 600`) 또는 OS 키체인·시크릿 매니저 사용을 권장.
+> 동시 실행되는 인스턴스가 여럿이면 `serialize()`/`deserialize()` 경합 가능 → 파일 락(`fcntl.flock` 등) 또는 단일 인스턴스 강제 권장.
+
+### 6.5.5 파일 크기 제한 → 업로드·다운로드 모두 해당
+
+Graph API는 파일 크기에 따라 처리 방식이 갈림.
+
+| | Microsoft 공식 | Softeria |
+|---|---|---|
+| **업로드** | Simple Upload만 → **5MB 제한** | Upload Session 구현 → **대용량 OK** |
+| **다운로드** | 5MB 미만만 | OneDrive 자체 한계까지 (단, LLM 컨텍스트 한계는 별개) |
+
+- 업로드: 4MB 이하는 PUT 한 번(`Simple Upload`), 초과 시 `createUploadSession` → 청크 분할 필요. MS 공식은 이걸 구현 안 하고 5MB로 자르고, Softeria는 Upload Session까지 구현.
+- 다운로드: 메타데이터의 `@microsoft.graph.downloadUrl`(인증 없이 접근 가능, **약 1시간 만료**)로 받음. 단 **LLM이 호출자라면 파일 내용을 직접 읽을 수 있는 크기에 한계**가 있으므로, 대용량은 URL만 반환하는 분기가 필요.
+
+> 직접 구현 시 대용량 업로드가 필요하면 Upload Session을 구현해야 하고, 아니면 4MB 제한을 명시하면 됨.
+
+### 6.5.6 Graph API 검색 인덱싱 지연
+
+Confluence의 CQL과 동일한 문제. OneDrive의 `search` 엔드포인트는 인덱스 기반이라 **파일 업로드/수정 직후 검색하면 결과에 안 뜰 수 있음**.
+
+```python
+# ❌ 업로드 직후 검색 → 빈 결과 가능
+await upload_file(path="/reports", file_name="daily.txt", content="...")
+results = await search_files(query="daily")  # ← 빈 결과 가능
+
+# ✅ 경로 기반 목록 조회 → 즉시 반영
+await upload_file(path="/reports", file_name="daily.txt", content="...")
+files = await list_files(path="/reports")     # ← 즉시 확인 가능
+```
+
+> 검색(`/me/drive/root/search`)은 편의 기능, **정확한 존재 확인은 경로 기반 목록 조회(`/children`)** 사용.
 
 # **부록**
 
